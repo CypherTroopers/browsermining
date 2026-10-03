@@ -207,3 +207,47 @@ test('remote Common attachment uses its own origin and bearer for admission, con
   c.stop(); assert.ok(calls.some(row => row.url === B + '/relay/v1/mesh/sessions' && row.method === 'DELETE' && row.headers.Authorization === 'Bearer foreign-secret'));
   assert.equal(calls.filter(row => row.url.startsWith(B)).some(row => JSON.stringify(row).includes('primary-secret')), false);
 });
+
+for (const scenario of ['connect', 'wrong-identity', 'wrong-parent', 'late-off']) {
+  test(`new signed Common discovered at the home origin: ${scenario}`, async t => {
+    const saved = new Map(['location', 'fetch', 'WebSocket'].map(k => [k, globalThis[k]]));
+    const common = createBrowserIdentity(), nodeId = publicKeyNodeId(common.publicKeyHex);
+    const signed = signedEndpoint(common, A), calls = [], sockets = [], pending = deferred();
+    const primary = { id: id(1), browserId: id(2), peerId: id(3), nodeId: '11'.repeat(32), sourceId: 'common-a', token: 'primary-secret', expiresAt: Date.now() + 300000 };
+    const child = { id: id(40), parentId: scenario === 'wrong-parent' ? id(999) : primary.id, browserId: id(41), peerId: id(42), nodeId,
+      sourceId: 'common-b', token: 'child-secret', expiresAt: Date.now() + 300000 };
+    globalThis.location = { origin: A, href: A + '/', protocol: 'https:' };
+    globalThis.WebSocket = class { constructor(url) { this.url = String(url); this.readyState = 1; this.bufferedAmount = 0; this.sent = []; sockets.push(this); } send(text) { this.sent.push(text); } close() { this.readyState = 3; } };
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), ...options });
+      if (options.method === 'DELETE') return new Response(null, { status: 204 });
+      if (String(url).endsWith('/config')) return new Response(JSON.stringify({ enabled: true, version: 1, protocol: 'cypher-browser-mesh/1', network,
+        nodes: [{ id: child.sourceId, nodeId: scenario === 'wrong-identity' ? primary.nodeId : nodeId, enode: 'enode://' + common.publicKeyHex }] }));
+      if (String(url).endsWith('/sessions')) { if (scenario === 'late-off') await pending.promise; return new Response(JSON.stringify(child)); }
+      throw new Error('Unexpected request');
+    };
+    const c = new MeshController(); c.requested = true; c.generation = 1; c.abort = new AbortController(); c.session = primary; c.nativeConnected = true;
+    c.config = { network, nodes: [{ id: primary.sourceId, nodeId: primary.nodeId }], limits: { maxCommonConnections: 20 },
+      discovery: { version: 1, bootstrapOrigins: [A], directoryPath: '/relay/v1/mesh/discovery', rendezvousPath: '/relay/v1/mesh/rendezvous' } };
+    c.sourceErrors = {}; c.prelude = []; c.emit = () => {}; c.later = () => {};
+    c.discovery = new MeshDiscoveryClient(c, createBrowserIdentity(), 1); c.discovery.cache.add(signed);
+    c.attachments.set('native', { session: primary, connected: true, socket: { readyState: 1, close() {} } });
+    t.after(() => { c.stop(); for (const [k, v] of saved) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; } });
+    const filling = c.fillAttachments(1);
+    if (scenario === 'late-off') { await flush(); assert(calls.some(row => row.method === 'POST')); c.stop(); pending.resolve(); }
+    await filling;
+    assert.equal(c.config.nodes.length, 1, 'Signed discovery must work without modifying the initial pins');
+    const admission = calls.find(row => row.method === 'POST');
+    if (scenario === 'wrong-identity') { assert.equal(admission, undefined); assert.equal(sockets.length, 0); return; }
+    assert.deepEqual(JSON.parse(admission.body), { sourceId: child.sourceId, attach: true });
+    assert.equal(admission.headers.Authorization, 'Bearer primary-secret', 'Home attachment stays in its parent participation');
+    if (scenario === 'connect') {
+      assert.equal(sockets.length, 1); assert.equal(sockets[0].url, A.replace('https:', 'wss:') + '/relay/v1/mesh/connect');
+      const a = c.attachments.get(child.id); assert.equal(a.session.endpointBootId, id(700)); assert.equal(a.session.remoteOrigin, A);
+      sockets[0].onopen(); assert.deepEqual(JSON.parse(sockets[0].sent[0]), { token: child.token });
+    } else {
+      assert.equal(sockets.length, 0); assert.equal(c.attachments.has(child.id), false);
+      assert(calls.some(row => row.method === 'DELETE' && row.headers.Authorization === 'Bearer child-secret'), 'Rejected or late leases are released');
+    }
+  });
+}

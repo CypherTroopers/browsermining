@@ -295,7 +295,7 @@ func loadBrowserPublicRelayConfiguration(path string) (browserPublicRelayConfigu
 		return cfg, nil, err
 	}
 	if meshRaw, ok := fields["mesh"]; ok {
-		if _, err := publicRelayObject(meshRaw, "allowedOrigins", "publicGatewayOrigin?"); err != nil {
+		if _, err := publicRelayObject(meshRaw, "allowedOrigins", "publicGatewayOrigin?", "gatewayUplink?"); err != nil {
 			return cfg, nil, err
 		}
 		if err := validateBrowserMeshConfiguration(cfg.Mesh); err != nil {

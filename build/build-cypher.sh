@@ -426,7 +426,7 @@ prepare_bounded_leveldb
 # Validate the relay in the same native build. Platform transport fixtures use
 # build tags; HTTP sessions, mesh streams and P2P tests run on every native OS.
 "${GO_BIN}" test "${NATIVE_GO_FLAGS[@]}" ./cmd/cypher ./node/browserrelay ./p2p \
-  -run '^(TestMesh|TestBrowserMesh|TestBrowserPublicRelay|TestPublicRelay)' \
+  -run '^(TestMesh|TestBrowserMesh|TestBrowserSource|TestBrowserPublicRelay|TestPublicRelay)' \
   -count=1 -timeout=120s
 
 # Run adapter tests in the same native-library environment used by this build.

@@ -117,8 +117,12 @@ export class MeshController extends RelayController {
   async fillAttachments(g) {
     if (!this.live(g) || !this.nativeConnected || this.aiLoad !== 'idle' || this.attachmentAdmission || this.attachments.size >= this.commonLimit()) return;
     const parent = this.session;
-    const discovered = (this.discovery?.endpoints() || []).filter(n => n.origin !== location.origin).map(endpoint => ({ id: endpoint.sourceId, nodeId: endpoint.nodeId, endpoint }));
-    const targets = [...discovered, ...this.config.nodes].filter(n => ![...this.attachments.values()].some(a => a.session.nodeId === n.nodeId));
+    // An authenticated Common can join this gateway after the initial config
+    // read. Its signed endpoint must be eligible without cycling node OFF/ON.
+    const discovered = (this.discovery?.endpoints() || []).filter(n => n.origin !== location.origin ||
+      !this.config.nodes.some(pin => pin.nodeId === n.nodeId)).map(endpoint => ({ id: endpoint.sourceId, nodeId: endpoint.nodeId, endpoint }));
+    const targets = [...new Map([...discovered, ...this.config.nodes].map(n => [n.nodeId, n])).values()]
+      .filter(n => ![...this.attachments.values()].some(a => a.session.nodeId === n.nodeId));
     const target = targets.find(n => { const r = this.attachmentRetries.get(n.nodeId); return (!r || (r.failures < 12 && r.at <= Date.now())); });
     if (!target) { if (targets.some(n => (this.attachmentRetries.get(n.nodeId)?.failures || 0) < 12)) this.scheduleAttachments(g, 5000); return; }
     const marker = {}; this.attachmentAdmission = marker; let child;
@@ -130,7 +134,10 @@ export class MeshController extends RelayController {
         if (remote.version !== 1 || remote.protocol !== PROTOCOL || !remote.enabled || !Array.isArray(remote.nodes) || remote.nodes.length > 64 ||
           remote.network?.chainId !== this.config.network.chainId || remote.network?.genesisHash !== this.config.network.genesisHash ||
           !remote.nodes.some(n => n.id === endpoint.sourceId && n.nodeId === endpoint.nodeId && (n.publicKey || enodePublicKey(n.enode)) === endpoint.publicKey)) throw new Error('Remote gateway does not expose the signed Common identity');
-        child = await discoveryJSON(this, endpoint.origin, '/sessions', { method: 'POST', body: JSON.stringify({ sourceId: endpoint.sourceId }), max: 16384 }, g);
+        const home = endpoint.origin === location.origin;
+        child = await discoveryJSON(this, endpoint.origin, '/sessions', { method: 'POST',
+          body: JSON.stringify({ sourceId: endpoint.sourceId, ...(home ? { attach: true } : {}) }),
+          ...(home ? { token: parent.token } : {}), max: 16384 }, g);
         // Mark the origin before any later validation so a rejected or late lease
         // is released only at the origin which issued it.
         child.remoteOrigin = endpoint.origin;
@@ -138,7 +145,7 @@ export class MeshController extends RelayController {
         child.endpointAdvertisement = endpoint.envelope;
       } else { child = await this.json('/sessions', { method: 'POST', body: JSON.stringify({ sourceId: target.id, attach: true }), token: parent.token, max: 16384 }, g); delete child.remoteOrigin; }
       if (!this.live(g) || this.session !== parent) { this.releaseSession(child); return; }
-      this.validateSession(child, target.endpoint ? undefined : parent.id, target.endpoint);
+      this.validateSession(child, target.endpoint && target.endpoint.origin !== location.origin ? undefined : parent.id, target.endpoint);
       if (child.sourceId !== target.id || this.attachments.has(child.id) || child.id === parent.id || [...this.attachments.values()].some(a => a.session.nodeId === child.nodeId) || this.attachments.size >= this.commonLimit()) throw new Error('Duplicate or excess Common attachment');
       this.openNative(g, child);
     } catch (error) {

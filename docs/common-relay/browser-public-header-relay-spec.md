@@ -56,7 +56,9 @@ binary自体は従来どおり既定OFF。直接起動は`--browser.public-relay
   },
   "sourceId": "common-mine",
   "mesh": {
-    "allowedOrigins": ["https://ai-test.make-cph-great-again.community"]
+    "allowedOrigins": ["https://ai-test.make-cph-great-again.community"],
+    "publicGatewayOrigin": "https://ai-test.make-cph-great-again.community",
+    "gatewayUplink": true
   }
 }
 ```
@@ -67,7 +69,7 @@ networkは研究ネットワークで確認した値。別networkへ流用しな
 
 Windowsのautoは実行user SIDと小文字化した絶対canonical config pathから導く`\\.\pipe\cypher-browser-relay-<32桁のSHA-256 hex>`。解決したendpointは`--verbosity 3`以上の起動logの`Browser relay listening`で確認する。macOS/Windows launcherの既定verbosityではこのINFO logは表示されない。明示指定は正確な`\\.\pipe\`prefixと、1〜128文字のASCII英数字・`_`・`-`だけのleafを許す。remote UNC、device path、dot/space/separator入りleafは拒否する。JSON内のbackslashはescapeする。protected DACLは実行owner SIDだけを許可し、remote pipe clientを拒否、既存pipeを上書きしない。config/任意鍵のownerは実行user SIDが必要で、Administrators所有のファイルもそのままでは受理しない。DACLでは他userの書込（鍵では読取も）を拒否し、SYSTEM/Administratorsは既に所有権を取得できる特権主体として許可する。途中のreparse pointや信頼しないownerによる置換を拒否する。Unix mode0600をWindowsのアクセス制御とみなさない。
 
-複数Commonはdatadir・native identity・config/endpoint・sourceIdを分ける。各Commonをowner gatewayのローカル接続先として設定する。§3.1の署名付き公開接続先とWeb側の自動広告を使えば、遠隔Commonの公開鍵を中央の固定一覧へ一台ずつ手動登録する必要はない。launcherによるノードONだけで公開TLS接続口やgatewayが作成されるわけではない。gatewayは同じhost・同じownerで動かし、owner限定権限を緩めない。Linux上のgatewayから別hostのWindows local pipeへ直接接続はできない。`start-cypher0..6.sh`という名前だけでCommonと判断せず、委員会プロセスには有効化しない。
+複数Commonはdatadir・native identity・config/endpointを分ける。同梱configの`mesh.gatewayUplink: true`により、Common自身が§3.2の公開gatewayへ外向きWSSで接続する。遠隔Commonごとの手動一覧登録、独自ドメイン、受信用公開ポート、別Node.js gatewayは不要。公開側ではnative identityに基づく一意のsourceIdを使い、owner APIのsourceIdは維持する。ローカルIPC方式を使う運用ではowner gatewayを同じhost・同じownerで動かし、owner限定権限を緩めない。Linuxのgatewayから別hostのWindows local pipeへ直接接続することはない。`start-cypher0..6.sh`という名前だけでCommonと判断せず、委員会プロセスには有効化しない。
 
 mesh専用ならP-256配布鍵もbounded header snapshotも不要。補助ヘッダー機能も有効にする場合だけ、後述のkeyId/signingKeyPathを追加する。
 
@@ -116,9 +118,25 @@ bootId, sequence, issuedAt, expiresAt
 
 既存 `cypher-browser-mesh/1` の広告payload・domain・WSS frameには変更を加えない。公開接続先の署名はURLとnative identityの対応を広告するもので、Common役割・接続成功・chain finalityの証明ではない。ブラウザの接続後はnative HELLOのidentity/boot/networkを照合し、両端の既存RLPxと役割検査を継続する。
 
-Web gatewayはローカルIPCから30秒ごとに取得し、検証済みenvelopeをdirectoryへ保持する。設定したbootstrap gatewayへ同じenvelopeを自動POSTする。ブラウザは未知のCommonも暗号署名を検証して候補にできる。bootstrapは発見の手掛かりであり、公開鍵の信頼元ではない。詳細な設定・公開API・ブラウザ署名・CORS・再現手順は[Web側の接続手順](/root/browser-llm-lab/relay/common-endpoint-native-handoff.md)を参照する。
+Web gatewayはローカルIPCから30秒ごとに取得し、検証済みenvelopeをdirectoryへ保持する。設定したbootstrap gatewayへ同じenvelopeを自動POSTする。ブラウザは未知のCommonも暗号署名を検証して候補にできる。bootstrapは発見の手掛かりであり、公開鍵の信頼元ではない。詳細な設定・公開API・ブラウザ署名・CORS・再現手順は[Web側の接続手順](../../browser-llm-lab/relay/common-endpoint-native-handoff.md)を参照する。
 
 固定Go/ブラウザ相互運用vectorは `node/browserrelay/testdata/mesh-endpoint-vector.json`。公開テストscalar 1と固定時刻を使用し、実運用鍵・研究networkとは区別する。今回追加の署名・改ざん・期限・更新失敗・再起動・owner HTTP・旧configの試験、Linux `make cypher` と `go test -race` のcmd/cypher・node/browserrelay・p2pはPASS。隔離buildのSHA-256は `be38686525295758caecfad9e76ddda4fc9579e3521b3651662fbf464e07052c`。下記§8の過去のnative LIVE記録は保持し、この追加機能の公開配信や異なる端末/回線の成功へ読み替えない。
+
+### 3.2. Commonから公開gatewayへの外向き接続
+
+`mesh.gatewayUplink`は任意booleanで、省略時false。trueには`mesh.publicGatewayOrigin`と同じOriginの`allowedOrigins`が必要。同梱launcher configはtrueを指定する。既存のprivate IPC、チェーンDB、native key、Common役割検査を再利用し、新しい公開RPCやTCP proxyは作らない。共通の`make cypher`で生成した新binaryと更新済みconfigを配布し、各オーナーは既存datadirのままCommonを停止・再起動する。古いbinaryは新しいconfig項目を受理しない。`init`による再初期化は不要。
+
+CommonはTLS検証を有効にした`wss://<publicGatewayOriginのhost>/relay/v1/mesh/source`へ自ら接続する。公開gatewayは5秒期限のランダムchallengeを送り、Commonは既存native keyで`Keccak256(UTF8("cypher-browser-mesh-source-v1\0") || exactChallengeBytes)`へ署名する。gatewayは署名付きendpointとchallengeの鍵一致、固定network/genesis、期限、同一identityの重複、接続元別の上限を検証して候補へ追加する。署名済み広告だけのリプレイでは接続を占有できない。ローカル接続先と同一identityのuplinkは拒否し、ローカル経路を優先する。uplinkが使えなくても通常native P2Pは継続する。
+
+uplinkのendpointは`sourceId = native enode ID (64桁hex)`。owner用endpointは設定したsourceIdのまま。bootIdは共通で、sequenceはプロセス全体で単調増加する。endpointは30秒更新、120秒期限。gatewayは元のenvelopeを配布し、再署名しない。離脱・期限切れで候補と該当sessionを撤去し、再接続には新challenge・新browser sessionを使う。
+
+中継するのは固定mesh HTTPのconfig/status/session/renewとnative mesh WSのみ。Common内部の有界in-process接続で既存HTTP handlerを再利用する。uplink所有token以外を操作できず、切断時もownerの別sessionを失効させない。任意のRPC/IPC/URL/host/portを要求できない。WS native Ping/Pongはブラウザまで転送し、gatewayやuplinkがブラウザの生存応答を代作しない。
+
+外側JSONは最大96KiB（64KiB statusのbase64化を含む）。送受信それぞれ384KiB/s・burst512KiB、128件/s・burst256、queueは64件かつ512KiB、HTTP同時8件、native WS最大80、stream ID履歴最大4096。外側のbase64分の予算であり、native内部のJSON frame16KiB、chunk8KiB、session64KiB/s、node256KiB/s、共有40回線等を引き上げない。metadataのdeadlineとqueue滞留は有限、4096stream使用後は新uplink世代へ移る。
+
+gatewayは`sourceUplink: {enabled: true, maxSources: 32, maxSourcesPerClient: 4}`で受入を有効化する。ローカルと遠隔を合計64Common以内、未認証は全体8・接続元2、既存の全体接続・通信量上限も適用する。ブラウザのCommon接続上限20・WebRTC peer上限20・Workerの共有40回線は維持する。ON中に追加された同じgatewayのCommonも署名検証して発見する。これは公開gatewayをbootstrapに用いる方式であり、すべてのCommonやgatewayを無条件に世界中から発見する仕組みではない。
+
+今回の検証結果と未実施範囲は[Web側の運用記録](../../browser-llm-lab/relay/common-endpoint-native-handoff.md)に追記する。過去のnative fixtureやWebRTC検証結果を今回のuplinkの成功へ読み替えない。
 
 ## 4. browser接続の世代とCommon広告
 

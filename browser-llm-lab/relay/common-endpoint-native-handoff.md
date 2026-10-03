@@ -6,6 +6,73 @@
 
 Common 側の署名・配布と Web 側の取得・検証を実装した。以下は、両ディレクトリで作業を引き継ぐための実装契約と運用手順である。稼働切替や異なる地域・回線での試験は、ソースの実装・ローカル試験とは別に記録する。
 
+## 外向きsource uplinkによる自動接続（2026-10-03）
+
+公開接続先の署名だけでは、別サーバーのprivate socketへ到達できなかった。今回、同じCypher binaryに外向きsource uplinkを追加し、公開gatewayとブラウザの動的探索へ接続した。既存の共通launcherは変更せず、更新済みbinaryと同梱configにより有効になる。Common間の実際の相手認証と暗号化は既存RLPxで行う。gatewayのchallenge署名はsource transportの鍵所有確認であり、Commonの委員会役割やチェーン採用の証明ではない。
+
+```text
+遠隔Common -- outbound WSS /mesh/source -- 公開gateway -- WSS -- browser
+既存Common -- owner private Unix socket -- 公開gateway -- WSS -- browser
+                                                   browser -- WebRTC -- browser
+```
+
+遠隔側は、既存checkout・datadir・launcherを維持して更新する。`make cypher`は現在のソースをbuildするだけで、更新をダウンロードしない。配布patchはHEAD `110fafb8fd4a159f4d810be8dabc50f6818401ab`を基準としている。既存変更を保存し、先に`git apply --check`が通ることを確認する。通らないcheckoutへ強制適用・resetは行わない。
+
+配布成果物の保存先は、Webリポジトリ内の`relay/evidence/source-uplink-20261003/common-source-uplink.patch`と、`.runtime/releases/source-uplink-20261003/common-source-uplink-linux-amd64-20261003.tar.gz`。これらはサーバー内のファイル位置であり、公開ダウンロードURLではない。配布されたpatchを遠隔側へ転送してから、例えば次を実行する。prebuilt archiveを使う場合も、配布元のhash・内容・対象OS/architectureを確認し、既存datadir/configを上書きしない。
+
+```sh
+cd ~/browsermining
+# 配布されたpatchの実際の保存先へ置き換える:
+git apply --check /path/to/common-source-uplink.patch
+git apply /path/to/common-source-uplink.patch
+make cypher
+chmod 600 config/browser-relay/common-mine.json
+# 既存のCommonを、そのCommonの通常の運用方法で停止してから:
+./colossusX_linux.sh
+```
+
+この例は、すでに`colossusX_linux.sh`で稼働しているユーザー向けである。そのlauncherの既存datadirは`chaindbname`。`start-cyphermine.sh`等で稼働している場合は、その同じlauncherと既存datadir（例:`chaindbmine`）を使い続ける。今回の機能追加を理由に別のlauncherへ切り替えない。
+
+既存datadirの再初期化、nodekeyの置換、新しいchain/genesisの生成は不要。新binaryを更新せずconfigだけ置き換えると、旧binaryの未知key検査で停止する。`start-cyphermine.sh`、macOS/Windows launcherも同じ同梱configを使うが、今回のnative build/運用検証はLinux amd64のみ。
+
+同梱configのmeshは次の設定。旧configを自分で維持する場合は、このbooleanを明示する。
+
+```json
+{
+  "allowedOrigins": ["https://ai-test.make-cph-great-again.community"],
+  "publicGatewayOrigin": "https://ai-test.make-cph-great-again.community",
+  "gatewayUplink": true
+}
+```
+
+接続先は`wss://ai-test.make-cph-great-again.community/relay/v1/mesh/source`。Commonが外向きTCP443/TLSで接続する。私有native鍵はprocess内で署名に使うだけで、gateway・ブラウザへ渡さない。遠隔CommonはnodeId64をsourceIdとして公開し、異なるCommonが同じ`common-mine`設定を使用しても衝突しない。DB/nodekeyをコピーした同一identityの2つのprocessは、別Commonとして受け付けない。
+
+公開gatewayは`sourceUplink: {enabled:true,maxSources:32,maxSourcesPerClient:4}`を設定済み。既存ローカルCommonはowner socket経路を優先する。source切断・期限切れで候補と対象leaseを撤去し、新しい接続は新challenge/stream/sessionから開始する。同じoriginへ後から加わったCommonも、ON中のブラウザが署名とfresh configを照合して追加接続する。実接続数はCommon connectionsに表示し、Browser peersは独立した直接WebRTC接続数を表示する。
+
+制限: gateway全体でlocal socketとsource uplinkの合計80browser lease・384connections・1MiB/sの既存予算、source最大32/IP当たり4、localとuplinkの合計target64（directory cacheも別枠で最大64）、browser当たり20Common/20RTC、Worker共有40回線。uplink外側JSON最大96KiB・送受信384KiB/s・queue64件かつ512KiB・metadata8件・native WS80・世代内stream履歴4096。内側のnative frame16KiB/chunk8KiB/1session64KiB/s/node256KiB/s等は変更しない。40回線や20接続すべてに帯域を別々に保証するものではない。source uplinkは到達可能な設定済みgatewayを用いる経路であり、世界中のあらゆるノードを自動走査する機能ではない。
+
+通常の起動・停止は従来のCommon lifecycle、ブラウザはNode ON/OFF、uplinkだけ無効化する場合はmesh.gatewayUplink=falseを設定してCommonを再起動する。Common全体のブラウザ中継OFFは`CYPHER_BROWSER_RELAY=0`で既存launcherを起動する。gatewayは[既存の限定操作手順](gateway-operations.md)でそのgatewayのみ再起動する。native/committee全体へのPM2操作は不要。
+
+再現試験は`tests/mesh-source-uplink-ui.mjs`と`tests/mesh-source-uplink-browser.mjs`。どちらも明示的な`SOURCE_ACCEPTANCE_AUTHORIZED=1`が必要で、Commonの起動・停止は行わず、自分が起動したChromeだけを終了する。独立browser試験には、専用datadir/identityで起動したCommonの`SOURCE_ID=<nodeId64>`と`SOURCE_NATIVE_IPC=<absolute IPC path>`を渡す。試験Commonをgatewayの固定nodesへ追加してはいけない。UIは実ページのNode ONで、初期に不在だったsourceの自動追加を確認する。RTC試験はbrowser当たりCommonを1つに制限して、同一Worker内のCommon間転送をRTC成功へ数えない。
+
+
+今回の最終LIVE結果（Linux amd64、同一ホスト上の独立Chrome。別物理端末/回線ではない）:
+
+| 検証 | 結果 |
+| --- | --- |
+| 通常公開UI、ON後の未知Common追加 | Common connections 1→2。OFF/ONなし。同じbrowser世代。署名/native HELLO照合。OFFでWorker/接続回収 |
+| 独立browser A→B | seq19、7,734 raw bytes、exact ciphertext・SHA-256・hop ACK一致。native circuit受信114,509 bytes |
+| A OFF、代替経路なし | native peer/circuit/queue 0。drain後の新規受信/転送counter不変 |
+| 代替C→B | 新circuitのseq19、7,734 bytes/ACK一致。native circuit受信9,496 bytes。Bが新規取得した高さ576のhash一致 |
+| 新規データの区別 | A停止・drain後444→C経由576。後からimportされた既存bufferを新規転送へ数えない |
+| 更新・AI pause policy | 130,043ms。B/C各1回lease更新、同じbrowser/native sessionとgeneration、署名endpoint更新。実LLM負荷ではなくloading状態通知 |
+| 通常build・race・Web tests | make cypher PASS。cmd/cypher・node/browserrelay race PASS。Web348 PASS、0 FAIL、任意TURN3 SKIP |
+| cleanup | 試験Common終了、専用DB/鍵/config/socket削除、gateway候補2→1、元のnative/page/TURN PIDと開始時刻維持 |
+
+試験Commonのdiscovery/static/trusted/bootstrapは無効/空で、native接続はbrowser-meshのみ。TxQUICは取引送信/受領証経路であり、確認した処理にblock同期経路はない。OS network namespaceによる遮断は実施していない。hop ACKは相手browserの受領であり、native消費・finalityの証明ではない。完全なreport/log、限定経路監査、build SHA/provenance、更新patchを[evidence/source-uplink-20261003](evidence/source-uplink-20261003/)へ保存した。Python HTTPSのcleanup確認はCDN403で変更前に停止したため、cleanupの候補回収確認は稼働gatewayのloopback configを使用。実際の公開HTTPS/WSS/RTC経路はChromeでPASS。
+
+検証記録: `evidence/source-uplink-20261003/`に最終結果を保存した。元の`vmi3586715`サーバー、別物理端末/回線、macOS/Windows、実スマホ、今回追加uplinkの30分以上の継続負荷はこの実装時点で未実施。古い31分試験は旧構成の結果として保持し、新source uplinkの成功へ読み替えない。
+
 ## 1. 現在の実装範囲
 
 | 対象 | 実装 |
@@ -17,7 +84,7 @@ Common 側の署名・配布と Web 側の取得・検証を実装した。以�
 
 Common は採掘・合意形成の鍵や native 秘密鍵をブラウザへ渡さない。ブラウザの自己署名レコードはブラウザの一時 identity を証明する。レコード内の `nodeId` だけで、そのブラウザと Common の所属関係が証明されるわけではない。
 
-通常の Common P2P 参加に、この Web への登録は必要ない。ブラウザ用公開接続口を提供する運用者は、自分の Common と同じ所有者・同じホストの gateway を接続し、TLS と公開 origin を準備する。遠隔の Common の公開鍵を中央管理者が一台ずつ allowlist へ追加する運用は不要となる。
+通常のCommon P2P参加に、このWebへの登録は必要ない。同梱設定の`mesh.gatewayUplink: true`では、Common自身が公開gatewayへ外向きWSSで接続し、鍵の所有をchallenge署名で確認した後、gatewayが接続候補へ自動追加する。ノードオーナーによる手動一覧登録、各Common用の公開受信ポート・独自ドメイン・Node.js gatewayは不要。独自の地域gatewayを運用したい場合には、後述のownerローカル方式とTLS設定を使用できる。
 
 ## 2. ネイティブ設定
 
@@ -49,7 +116,7 @@ Common は採掘・合意形成の鍵や native 秘密鍵をブラウザへ渡�
 - `allowedOrigins` は private API に到着する gateway の `nativeOrigin` に合わせる。実際の Web フロントエンドの許可 origin は、公開 gateway の `discovery.allowedOrigins` で別途設定する。
 - owner 限定 config/socket、既存の Common 役割検査、datadir、鍵の所有権、要求数・接続数上限は維持する。既存 DB を別プロセスで重複して開かない。
 
-ノードはこの URL に対して DNS 解決や HTTP 接続を行わない。自分の公開接続先という claim に署名する。公開接続口の生存や、その WSS が同じ Common へ到達することは、Web 側の接続と native HELLO の一致で別途確認する。
+公開endpointの署名処理自体はURLへの接続を行わない。`gatewayUplink: true`の場合だけ、設定済み公開originへDNS解決とTLS検証付きWSS接続を行う。公開接続口が同じCommonへ到達することは、Web側の接続とnative HELLOのidentity/boot一致で確認する。
 
 ## 3. 署名対象の固定契約
 
@@ -91,7 +158,7 @@ signature = crypto.Sign(digest, existingNativeNodeKey)
 - `issuedAt` / `expiresAt` は Unix epoch milliseconds の整数。TTL は最大 120000 ms。検証時刻より 10000 ms を超えて未来の issuedAt を拒否する。
 - `bootId` は **既存 mesh 広告と同じ** `Mesh.bootID`。32 桁の小文字 hex。プロセス再起動で更新する。
 
-既存の `cypher-browser-mesh/1` 広告にはフィールドを追加しない。既存 domain `cypher-browser-mesh-advertisement-v1\0` と新 endpoint domain を区別する。WSS/frame/RLPx の契約も維持する。
+既存の `cypher-browser-mesh/1` 広告にはフィールドを追加しない。既存 domain `cypher-browser-mesh-advertisement-v1\0` と新 endpoint domain を区別する。内側のnative WSS/frame/RLPxの契約は維持し、source uplinkでは別の有界な外側multiplex形式で運ぶ。
 
 ## 4. 生成・更新・停止
 

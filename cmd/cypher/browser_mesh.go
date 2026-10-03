@@ -30,6 +30,7 @@ import (
 type browserMeshConfiguration struct {
 	AllowedOrigins      []string `json:"allowedOrigins"`
 	PublicGatewayOrigin string   `json:"publicGatewayOrigin,omitempty"`
+	GatewayUplink       bool     `json:"gatewayUplink,omitempty"`
 }
 
 func validateBrowserMeshConfiguration(c *browserMeshConfiguration) error {
@@ -41,6 +42,9 @@ func validateBrowserMeshConfiguration(c *browserMeshConfiguration) error {
 			return err
 		}
 	}
+	if c.GatewayUplink && c.PublicGatewayOrigin == "" {
+		return errors.New("mesh gateway uplink requires a configured HTTPS gateway origin")
+	}
 	seen := make(map[string]bool)
 	for _, origin := range c.AllowedOrigins {
 		u, err := url.Parse(origin)
@@ -49,6 +53,9 @@ func validateBrowserMeshConfiguration(c *browserMeshConfiguration) error {
 		}
 		seen[origin] = true
 	}
+	if c.GatewayUplink && !seen[c.PublicGatewayOrigin] {
+		return errors.New("mesh gateway uplink origin must be allowed by the native handler")
+	}
 	return nil
 }
 
@@ -56,6 +63,7 @@ type browserRelayRuntime struct {
 	exporter *browserrelay.Exporter
 	mesh     *browserrelay.Mesh
 	http     *browserMeshHTTP
+	uplink   *browserSourceUplink
 }
 
 func (r *browserRelayRuntime) Start() error {
@@ -70,12 +78,21 @@ func (r *browserRelayRuntime) Start() error {
 			return err
 		}
 		r.http.start()
+		if r.uplink != nil {
+			if err := r.uplink.Start(); err != nil {
+				_ = r.Stop()
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 func (r *browserRelayRuntime) Stop() error {
 	var err error
+	if r.uplink != nil {
+		r.uplink.Stop()
+	}
 	if r.http != nil {
 		r.http.stop()
 	}
@@ -131,6 +148,9 @@ func initializeBrowserMesh(g *browserPublicRelayStartup, stack *node.Node, backe
 			},
 			MaxPeers: min(p2p.BrowserMeshMaxPeers, srv.MaxPeers), MaxPending: 4, MaxFrameBytes: 4 << 20, BytesPerSecond: 16 << 10}
 		runtime.http = newBrowserMeshHTTP(g.ctx, mesh, g.public.Mesh.AllowedOrigins)
+		if g.public.Mesh.GatewayUplink {
+			runtime.uplink = newBrowserSourceUplink(mesh, runtime.http, g.public.Mesh.PublicGatewayOrigin, func(digest []byte) ([]byte, error) { return crypto.Sign(digest, srv.PrivateKey) })
+		}
 		mux.Handle("/relay/v1/mesh/", runtime.http)
 	}
 	g.source, g.handler = runtime, mux

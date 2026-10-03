@@ -469,3 +469,36 @@ func TestPublicRelayEndpointConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicRelayGatewayUplinkConfiguration(t *testing.T) {
+	path, cfg := publicRelayTestConfig(t)
+	cfg.KeyID, cfg.SigningKeyPath = "", ""
+	cfg.Mesh = &browserMeshConfiguration{AllowedOrigins: []string{"https://gateway.example.org"}, PublicGatewayOrigin: "https://gateway.example.org", GatewayUplink: true}
+	raw, _ := json.Marshal(cfg)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := loadBrowserPublicRelayConfiguration(path)
+	if err != nil || !loaded.Mesh.GatewayUplink {
+		t.Fatal("uplink config", err)
+	}
+	for _, value := range []string{`null`, `"true"`, `1`, `true,"gatewayUplink":false`} {
+		bad := strings.Replace(string(raw), `"gatewayUplink":true`, `"gatewayUplink":`+value, 1)
+		if err := os.WriteFile(path, []byte(bad), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := loadBrowserPublicRelayConfiguration(path); err == nil {
+			t.Fatal("ambiguous uplink accepted", value)
+		}
+	}
+	for _, origin := range []string{"", "https://other.example.org"} {
+		cfg.Mesh.PublicGatewayOrigin = origin
+		raw, _ = json.Marshal(cfg)
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := loadBrowserPublicRelayConfiguration(path); err == nil {
+			t.Fatal("unserved uplink origin accepted")
+		}
+	}
+}

@@ -8,6 +8,7 @@ import { countryCentroid } from './geo.mjs';
 import { loadTurnSecret,turnCredentials } from './turn.mjs';
 import { createDiscovery } from './discovery.mjs';
 import { enodePublicKey } from '../public/mesh-discovery.js';
+import { createSourceUplink } from './source-uplink.mjs';
 
 const BASE='/relay/v1/mesh',TOKEN=/^[a-f0-9]{64}$/;
 const headers={'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'};
@@ -30,8 +31,14 @@ export function createGateway({config,now=Date.now}={}) {
   const dropReasons=Object.fromEntries(['session_ended','session_expired','pong_timeout','transfer_limit','response_failed',
     'native_capacity','invalid_native_frame','invalid_native_hello','invalid_native_advertisement','native_pin_mismatch',
     'upstream_closed','upstream_error','native_auth_timeout','invalid_control','signal_capacity','client_closed','manual_off','gateway_shutdown'].map(reason=>[reason,0]));
-  const nodeState=new Map(settings.nodes.map(node=>[node.id,{pending:0,metadata:0,requests:new Bucket(16,32,now),
-    admissions:new Bucket(limits.nativeAdmissionsPerSecond,limits.nativeAdmissionBurst,now),capabilities:null,capabilityEpoch:0,configAt:0,configRead:null,status:null,statusAt:0,statusRead:null,releases:new Map()}]));
+  // State follows an immutable target generation, not its reusable sourceId.
+  // A disconnected uplink may have outstanding HTTP callbacks during reconnect.
+  const targets=new Map(settings.nodes.map(node=>[node.id,node])),nodeState=new Map();
+  const currentNodes=()=>[...targets.values()];
+  const activeNode=node=>targets.get(node.id)===node;
+  const newNodeState=node=>{const state={pending:0,metadata:0,requests:new Bucket(16,32,now),
+    admissions:new Bucket(limits.nativeAdmissionsPerSecond,limits.nativeAdmissionBurst,now),capabilities:null,capabilityEpoch:0,configAt:0,configRead:null,status:null,statusAt:0,statusRead:null,releases:new Map()};nodeState.set(node,state);return state;};
+  settings.nodes.forEach(newNodeState);
   let order=0,nodeIndex=0,closed=false,pendingAdmissions=0;
   const requests=new Bucket(limits.httpRequestsPerSecond,limits.httpRequestsPerSecond*2,now);
   const bytes=new Bucket(limits.httpBytesPerSecond,Math.max(65536,limits.httpBytesPerSecond*2),now);
@@ -40,9 +47,10 @@ export function createGateway({config,now=Date.now}={}) {
     nodes:settings.nodes.map(({id,nodeId,enode})=>({id,nodeId,enode})),sessionSeconds:300,renewAfterSeconds:120,
     maxFrameBytes:limits.maxNativeFrameBytes,nativeMaxFrameBytes:4*1048576,signalPath:BASE+'/signal',connectPath:BASE+'/connect',
     iceServers:settings.iceServers,turnEnabled:Boolean(settings.turn),limits};
-  const nativeCount=id=>[...sessions.values()].filter(s=>s.node.id===id).length+nodeState.get(id).pending+nodeState.get(id).releases.size;
+  const nativeCount=node=>[...sessions.values()].filter(s=>s.node===node).length+nodeState.get(node).pending+nodeState.get(node).releases.size;
+  const updatePublicNodes=()=>{publicConfig.nodes=currentNodes().map(({id,nodeId,enode})=>({id,nodeId,enode}));};
   async function capabilities(node) {
-    const state=nodeState.get(node.id);
+    const state=nodeState.get(node);
     if(state.capabilities&&now()-state.configAt<limits.nativeConfigCacheMs)return state.capabilities;
     if(state.configRead)return state.configRead;
     const epoch=state.capabilityEpoch;
@@ -63,19 +71,20 @@ export function createGateway({config,now=Date.now}={}) {
     })();
     try{return await state.configRead;}finally{state.configRead=null;}
   }
-  function invalidateNative(node){const state=nodeState.get(node.id);state.configAt=0;state.status=null;state.capabilityEpoch++;}
+  function invalidateNative(node){const state=nodeState.get(node);state.configAt=0;state.status=null;state.capabilityEpoch++;}
   async function choose(sourceId,cancelled=()=>false) {
-    if(sourceId!==undefined&&!settings.nodes.some(n=>n.id===sourceId))throw fault('unknown_source');
+    if(sourceId!==undefined&&!targets.has(sourceId))throw fault('unknown_source');
     // Rotate the first choice while retaining every Common as a bounded fallback.
     const start=nodeIndex++;
-    const nodes=sourceId===undefined?settings.nodes.map((_,index)=>settings.nodes[(start+index)%settings.nodes.length]):settings.nodes.filter(n=>n.id===sourceId);
+    const available=currentNodes(),nodes=sourceId===undefined?available.map((_,index)=>available[(start+index)%available.length]):available.filter(n=>n.id===sourceId);
     let denied=fault('native_capacity',503);
     for(const node of nodes){
       if(cancelled())throw fault('admission_cancelled',499);
-      const state=nodeState.get(node.id);let caps;
+      const state=nodeState.get(node);let caps;
       try{caps=await capabilities(node);}catch(cause){denied=cause;continue;}
       if(cancelled())throw fault('admission_cancelled',499);
-      if(nativeCount(node.id)>=Math.min(limits.maxSessionsPerCommon,caps.maxSessions)){denied=fault('native_capacity',503);continue;}
+      if(!activeNode(node)){denied=fault('native_unavailable',503);continue;}
+      if(nativeCount(node)>=Math.min(limits.maxSessionsPerCommon,caps.maxSessions)){denied=fault('native_capacity',503);continue;}
       if(!state.admissions.take()){denied=fault('native_admission_rate',429);continue;}
       state.pending++;return{node,caps};
     }
@@ -110,10 +119,12 @@ export function createGateway({config,now=Date.now}={}) {
     const session=authToken(bearer.slice(7));if(!session.requests.take())throw fault('session_rate',429);return session;}
   function nativeRequest(node,path,{method='GET',token,body}={}) {
     if(!['config','sessions','renew','status','endpoint'].includes(path))return Promise.reject(fault('native_path_denied'));
-    const state=nodeState.get(node.id);
+    const state=nodeState.get(node);
     if(state.metadata>=limits.nativeMetadataConcurrency)return Promise.reject(fault('native_metadata_capacity',503));
     if(!state.requests.take())return Promise.reject(fault('native_rate',429));
+    if(node.uplink?.closed)return Promise.reject(fault('native_unavailable',502));
     state.metadata++;const maxResponse=path==='status'?limits.maxNativeStatusBytes:limits.maxNativeResponseBytes;
+    if(node.uplink)return node.uplink.request(path,{method,token,body,maxResponse}).finally(()=>{state.metadata--;});
     return new Promise((resolve,reject)=>{
       const controller=new AbortController();pending.add(controller);let size=0,done=false;const parts=[];
       const finish=(cause,result)=>{if(done)return;done=true;clearTimeout(timer);pending.delete(controller);state.metadata--;cause?reject(cause):resolve(result);};
@@ -127,7 +138,7 @@ export function createGateway({config,now=Date.now}={}) {
     });
   }
   async function nativeStatus(node) {
-    const state=nodeState.get(node.id);
+    const state=nodeState.get(node);
     if(state.status&&now()-state.statusAt<limits.nativeStatusCacheMs)return state.status;
     if(state.statusRead)return state.statusRead;
     state.statusRead=(async()=>{
@@ -147,7 +158,7 @@ export function createGateway({config,now=Date.now}={}) {
   // Failed cleanup is retained within the same 80-slot budget, retried at most once
   // per second, and forgotten only on native acknowledgement or lease expiry.
   function releaseNative(node,token,expiresAt=now()+limits.sessionLeaseMs) {
-    if(!token)return Promise.resolve();const state=nodeState.get(node.id);
+    if(!token||node.uplink?.closed)return Promise.resolve();const state=nodeState.get(node);
     if(!state.releases.has(token)){
       if(state.releases.size>=limits.maxSessionsPerCommon)return Promise.resolve();
       state.releases.set(token,{expiresAt,inFlight:null,retryAt:0});
@@ -155,7 +166,7 @@ export function createGateway({config,now=Date.now}={}) {
     return flushRelease(node,token,state.releases.get(token));
   }
   function flushRelease(node,token,entry) {
-    const state=nodeState.get(node.id);
+    const state=nodeState.get(node);
     if(entry.expiresAt<=now()){state.releases.delete(token);return Promise.resolve();}
     if(entry.inFlight)return entry.inFlight;
     if(entry.retryAt>now()||state.metadata>=limits.nativeMetadataConcurrency)return Promise.resolve();
@@ -211,10 +222,33 @@ export function createGateway({config,now=Date.now}={}) {
       else if(s.nativePings&&[...s.nativePings.values()].some(p=>p.deadline<=now()))drop(s,{reason:'pong_timeout'});
     }
     for(const [key,c] of clients)if(c.expires<=now()&&!c.pending&&![...sockets].some(ws=>ws.clientKey===key))clients.delete(key);
-    for(const node of settings.nodes)for(const [token,entry] of nodeState.get(node.id).releases)void flushRelease(node,token,entry);}
-  const discovery=createDiscovery({settings,now,makeBucket:(rate,burst)=>new Bucket(rate,burst,now),nativeRequest,respond,
+    for(const [node,state] of nodeState){
+      for(const [token,entry] of state.releases)void flushRelease(node,token,entry);
+      if(!activeNode(node)&&!state.pending&&!state.metadata&&!state.releases.size)nodeState.delete(node);
+    }
+    sourceUplink?.sweep();}
+  const discovery=createDiscovery({settings,now,currentNodes,makeBucket:(rate,burst)=>new Bucket(rate,burst,now),nativeRequest,respond,
     takeBytes:n=>bytes.take(n),takeSignalBytes:n=>signalBytes.take(n),sockets,clientOccupancy:key=>[...sessions.values()].filter(s=>s.clientKey===key).length+(clients.get(key)?.pending??0)});
   if(discovery.publication)publicConfig.discovery=discovery.publication;
+  async function addUplink(record,transport){
+    if(closed||targets.size>=64||targets.has(record.sourceId)||currentNodes().some(node=>node.nodeId===record.nodeId))throw fault('source_conflict',409);
+    const node=Object.freeze({id:record.sourceId,nodeId:record.nodeId,enode:record.payload.enode,uplink:transport});
+    newNodeState(node);
+    try{
+      await capabilities(node);
+      if(closed||transport.closed||targets.size>=64||targets.has(node.id)||currentNodes().some(other=>other.nodeId===node.nodeId))throw fault('source_conflict',409);
+      discovery.addLocalEndpoint(record.envelope);
+      targets.set(node.id,node);updatePublicNodes();return node;
+    }catch(error){nodeState.delete(node);throw error;}
+  }
+  function removeUplink(node){
+    if(!node)return;
+    if(activeNode(node)){targets.delete(node.id);updatePublicNodes();discovery.removeLocalEndpoint(node.nodeId);}
+    for(const session of [...sessions.values()])if(session.node===node)drop(session,{reason:'upstream_closed'});
+    nodeState.get(node)?.releases.clear();
+  }
+  const sourceUplink=createSourceUplink({settings,now,makeBucket:(rate,burst)=>new Bucket(rate,burst,now),sockets,
+    takeBytes:n=>bytes.take(n),onAdd:addUplink,onRemove:removeUplink,onRefresh:(node,envelope)=>{if(activeNode(node))discovery.addLocalEndpoint(envelope);}});
   const timer=setInterval(sweep,1000);timer.unref();
   async function body(req){if(Number(req.headers['content-length'])>1024)throw fault('body_limit',413);return new Promise((resolve,reject)=>{
     const chunks=[];let size=0,done=false;const fail=e=>{if(done)return;done=true;req.pause();reject(e);};req.on('error',()=>fail(fault('invalid_body')));req.on('aborted',()=>fail(fault('invalid_body')));
@@ -239,7 +273,7 @@ export function createGateway({config,now=Date.now}={}) {
           Object.hasOwn(request,'attach')&&(request.attach!==true||typeof request.sourceId!=='string'))throw fault('invalid_body');
         const parent=request.attach===true?authenticate(req):null;
         if(parent&&(parent.parentId||parent.clientKey!==owner.key))throw fault('attachment_parent_required',403);
-        if(request.sourceId!==undefined&&!settings.nodes.some(node=>node.id===request.sourceId))throw fault('unknown_source');
+        if(request.sourceId!==undefined&&!targets.has(request.sourceId))throw fault('unknown_source');
         if(parent&&parent.group.sources.has(request.sourceId))throw fault('duplicate_source',409);
         if(parent&&parent.group.sources.size>=limits.maxCommonConnections)throw fault('attachment_capacity',409);
         if(sessions.size+pendingAdmissions>=limits.maxSessions)throw fault('session_capacity',503);
@@ -252,14 +286,14 @@ export function createGateway({config,now=Date.now}={}) {
         let node,caps,committed=false;
         let frontGone=false;res.once('close',()=>{if(!res.writableEnded)frontGone=true;});
         const parentGone=()=>parent&&(sessions.get(parent.id)!==parent||parent.expiresAt<=now());
-        const cancelled=()=>frontGone||res.destroyed||closed||parentGone();
+        const cancelled=()=>frontGone||res.destroyed||closed||parentGone()||(node&&!activeNode(node));
         try{
           ({node,caps}=await choose(request.sourceId,cancelled));
-          if(cancelled()){if(parentGone())throw fault('session_required',401);return;}
+          if(cancelled()){if(parentGone())throw fault('session_required',401);if(node&&!activeNode(node))throw fault('native_unavailable',503);return;}
           const reply=await nativeRequest(node,'sessions',{method:'POST',body:'{}'});if(reply.status!==201){if(reply.status!==429)invalidateNative(node);throw fault('native_admission_failed',reply.status===429?429:502);}
           const native=strictJSON(reply.body,limits.maxNativeResponseBytes);
           if(!exact(native,['token','browserId','expiresAt'])||!TOKEN.test(native.token??'')||!/^[a-f0-9]{32}$/.test(native.browserId??'')||!Number.isSafeInteger(native.expiresAt)||native.expiresAt<=now()||native.expiresAt>now()+305000)throw fault('invalid_native_session',502);
-          if(cancelled()){await releaseNative(node,native.token,native.expiresAt);if(parentGone())throw fault('session_required',401);return;}
+          if(cancelled()){await releaseNative(node,native.token,native.expiresAt);if(parentGone())throw fault('session_required',401);if(node&&!activeNode(node))throw fault('native_unavailable',503);return;}
           const group=parent?.group??{root:null,members:new Set(),sources:new Set([node.id]),transferred:req.bodyBytes,
             incoming:new Bucket(limits.sessionBytesPerSecond,131072,now),outgoing:new Bucket(limits.sessionBytesPerSecond,131072,now)};
           const token=randomBytes(32).toString('hex'),session={id:opaque(),peerId:parent?.peerId??opaque(),parentId:parent?.id??null,group,browserId:native.browserId,node,nativeLimits:caps,nativeToken:native.token,tokenHash:hash(token),
@@ -273,7 +307,7 @@ export function createGateway({config,now=Date.now}={}) {
           if(!respond(res,201,{id:session.id,peerId:session.peerId,browserId:session.browserId,sourceId:node.id,nodeId:node.nodeId,token,
             expiresAt:session.expiresAt,peers:[],iceServers:iceServers(session),geo:session.geo,nativeLimits:session.nativeLimits,
             ...parent?{parentId:parent.id}:{maxAttachments:limits.maxCommonConnections}},session))drop(session,{reason:'response_failed'});
-        }finally{pendingAdmissions--;owner.pending--;if(node)nodeState.get(node.id).pending--;if(parent&&!committed)parent.group.sources.delete(request.sourceId);}
+        }finally{pendingAdmissions--;owner.pending--;if(node)nodeState.get(node).pending--;if(parent&&!committed)parent.group.sources.delete(request.sourceId);}
         return;
       }
       if(!['renew','sessions','status'].includes(path))throw fault('not_found',404);
@@ -302,7 +336,9 @@ export function createGateway({config,now=Date.now}={}) {
   const nativeFront=new WebSocketServer({noServer:true,maxPayload:limits.maxNativeFrameBytes,perMessageDeflate:false,autoPong:false});
   server.on('upgrade',(req,socket,head)=>{try{
     sweep();const owner=client(req);
-    if(closed||!validOrigin(req)||![BASE+'/signal',BASE+'/connect',BASE+'/rendezvous'].includes(req.url)||sockets.size>=limits.maxConnections||!requests.take()||!owner.requests.take())throw fault('upgrade_denied');
+    if(closed||![BASE+'/signal',BASE+'/connect',BASE+'/rendezvous',BASE+'/source'].includes(req.url)||sockets.size>=limits.maxConnections||!requests.take()||!owner.requests.take())throw fault('upgrade_denied');
+    if(req.url===BASE+'/source'){sourceUplink.upgrade(req,socket,head,owner);return;}
+    if(!validOrigin(req))throw fault('upgrade_denied');
     if(req.url===BASE+'/rendezvous'){discovery.upgrade(req,socket,head,owner);return;}
     if(!settings.enabled)throw fault('admission_disabled');
     const key=owner.key;if([...sockets].filter(ws=>ws.clientKey===key).length>=limits.maxSignalConnectionsPerClient*2)throw fault('client_connection_capacity');
@@ -342,8 +378,8 @@ export function createGateway({config,now=Date.now}={}) {
     front.on('message',(data,binary)=>{try{
       if(!session){const message=strictJSON(data,limits.maxNativeFrameBytes);if(!exact(message,['token']))throw fault('authentication_required');
         const found=authToken(message.token);if(found.front||found.upstream)throw fault('already_attached');session=found;session.front=front;session.nativeReady=false;session.nativePings=new Map();clearTimeout(timer);
-        if(!account(session,data.length,'in')||!nodeState.get(session.node.id).requests.take())throw fault('native_capacity');
-        const upstream=new WebSocket('ws://localhost'+BASE+'/connect',{createConnection:()=>connectUnix({path:session.node.socketPath}),origin:settings.nativeOrigin,maxPayload:limits.maxNativeFrameBytes,
+        if(!account(session,data.length,'in')||!nodeState.get(session.node).requests.take())throw fault('native_capacity');
+        const upstream=session.node.uplink?session.node.uplink.connect(session.nativeToken):new WebSocket('ws://localhost'+BASE+'/connect',{createConnection:()=>connectUnix({path:session.node.socketPath}),origin:settings.nativeOrigin,maxPayload:limits.maxNativeFrameBytes,
           perMessageDeflate:false,autoPong:false,handshakeTimeout:2000});session.upstream=upstream;upstream.on('error',()=>abort('upstream_error'));upstream.on('close',()=>drop(session,{reason:'upstream_closed'}));
         session.nativeAuthTimer=setTimeout(()=>abort('native_auth_timeout'),limits.nativeAuthTimeoutMs);session.nativeAuthTimer.unref();
         upstream.on('open',()=>{if(sessions.get(session.id)!==session||front.readyState!==1)return upstream.terminate();upstream.send(JSON.stringify({token:session.nativeToken}));});
@@ -370,9 +406,9 @@ export function createGateway({config,now=Date.now}={}) {
       session.upstream.send(data,{binary:false});
     }catch(cause){abort(cause.code||'invalid_native_frame');}});
   });
-  return {server,config:publicConfig,sweep:()=>{sweep();discovery.sweep();},refreshDiscovery:discovery.refreshNative,stats:()=>({discovery:discovery.stats(),sessions:sessions.size,pendingAdmissions,webSockets:sockets.size,connections:connections.size,rateBuckets:clients.size,nodes:Object.fromEntries([...nodeState].map(([id,state])=>[id,{sessions:nativeCount(id)-state.pending-state.releases.size,pending:state.pending,releasing:state.releases.size,metadata:state.metadata,limits:state.capabilities}])),dropReasons:{...dropReasons}}),
+  return {server,config:publicConfig,sweep:()=>{sweep();discovery.sweep();},refreshDiscovery:discovery.refreshNative,stats:()=>({sourceUplink:sourceUplink.stats(),discovery:discovery.stats(),sessions:sessions.size,pendingAdmissions,webSockets:sockets.size,connections:connections.size,rateBuckets:clients.size,nodes:Object.fromEntries([...nodeState].filter(([node])=>activeNode(node)).map(([node,state])=>[node.id,{sessions:nativeCount(node)-state.pending-state.releases.size,pending:state.pending,releasing:state.releases.size,metadata:state.metadata,limits:state.capabilities}])),dropReasons:{...dropReasons}}),
     listen:({port=settings.listenPort,host=settings.listenHost}={})=>new Promise((resolve,reject)=>{if(!['127.0.0.1','::1'].includes(host))return reject(new Error('Loopback listener required'));server.once('error',reject);server.listen(port,host,()=>{server.removeListener('error',reject);resolve(server.address());});}),
-    close:async()=>{if(closed)return;closed=true;clearInterval(timer);await discovery.close();for(const s of [...sessions.values()])drop(s,{reason:'gateway_shutdown'});for(const ws of sockets)ws.terminate();for(const c of connections)c.destroy();
+    close:async()=>{if(closed)return;closed=true;clearInterval(timer);await sourceUplink.close();await discovery.close();for(const s of [...sessions.values()])drop(s,{reason:'gateway_shutdown'});for(const ws of sockets)ws.terminate();for(const c of connections)c.destroy();
       for(const controller of pending)controller.abort();await Promise.all([new Promise(r=>signaling.close(r)),new Promise(r=>nativeFront.close(r))]);if(server.listening)await new Promise(r=>server.close(r));},
   };
 }

@@ -826,3 +826,78 @@ func TestMeshEndpointLifecycle(t *testing.T) {
 		t.Fatal("legacy mesh should not publish an endpoint")
 	}
 }
+
+func TestMeshUplinkEndpointKeepsLocalLabelAndGlobalSequence(t *testing.T) {
+	key, _ := crypto.GenerateKey()
+	n := enode.NewV4(&key.PublicKey, net.IPv4(127, 0, 0, 1), 30445, 0)
+	m, err := NewMesh(MeshConfig{Network: Network{ChainID: 10101919, GenesisHash: "0x" + strings.Repeat("2", 64)}, LocalNode: func() *enode.Node { return n }, SignDigest: func(d []byte) ([]byte, error) { return crypto.Sign(d, key) }, OnInbound: func(c net.Conn, _ *enode.Node) error { return c.Close() }, SourceID: "common-mine", PublicGatewayOrigin: "https://gateway.example.org"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.UplinkEndpoint(); !errors.Is(err, ErrMeshUnavailable) {
+		t.Fatal("uplink before start")
+	}
+	if err = m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	decode := func(e MeshAdvertisement) meshEndpointPayload {
+		t.Helper()
+		if _, _, err := meshVerifyEndpoint(e, m.config.Network, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		var p meshEndpointPayload
+		raw, _ := base64.StdEncoding.DecodeString(e.PayloadBase64)
+		if json.Unmarshal(raw, &p) != nil {
+			t.Fatal("endpoint decode")
+		}
+		return p
+	}
+	local, _ := m.Endpoint()
+	lp := decode(local)
+	uplink, err := m.UplinkEndpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := decode(uplink)
+	if lp.SourceID != "common-mine" || up.SourceID != n.ID().String() || lp.BootID != up.BootID || up.Sequence <= lp.Sequence {
+		t.Fatal("source labels or generations were not separated")
+	}
+	if again, _ := m.Endpoint(); again != local {
+		t.Fatal("uplink changed local envelope")
+	}
+	if again, _ := m.UplinkEndpoint(); again != uplink {
+		t.Fatal("read unexpectedly resigned")
+	}
+	m.mu.Lock()
+	now := time.Now()
+	err = m.refreshEndpointLocked(now)
+	nextLocal := m.endpoint
+	err2 := m.refreshUplinkEndpointLocked(now)
+	nextUplink := m.uplinkEndpoint
+	m.mu.Unlock()
+	if err != nil || err2 != nil {
+		t.Fatal(err, err2)
+	}
+	if decode(nextLocal).Sequence <= up.Sequence || decode(nextUplink).Sequence <= decode(nextLocal).Sequence {
+		t.Fatal("independent counters allow rollback")
+	}
+	m.mu.Lock()
+	previous := m.uplinkEndpoint
+	sequence := m.endpointSequence
+	m.config.SignDigest = func([]byte) ([]byte, error) { return nil, errors.New("signer unavailable") }
+	err = m.refreshUplinkEndpointLocked(time.Now())
+	unchanged := m.uplinkEndpoint == previous && m.endpointSequence == sequence
+	m.uplinkAdvertisedAt = time.Now().Add(-MeshAdvertisementTTL - time.Second)
+	m.mu.Unlock()
+	if err == nil || !unchanged {
+		t.Fatal("failed signer changed lease")
+	}
+	if _, err = m.UplinkEndpoint(); !errors.Is(err, ErrMeshUnavailable) {
+		t.Fatal("expired uplink returned")
+	}
+	m.Stop()
+	if _, err = m.UplinkEndpoint(); !errors.Is(err, ErrMeshUnavailable) {
+		t.Fatal("uplink after stop")
+	}
+}

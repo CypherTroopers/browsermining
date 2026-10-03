@@ -91,6 +91,8 @@ type Mesh struct {
 	endpoint                                                     MeshAdvertisement
 	endpointSequence                                             uint64
 	endpointAdvertisedAt                                         time.Time
+	uplinkEndpoint                                               MeshAdvertisement
+	uplinkAdvertisedAt                                           time.Time
 	sessions                                                     map[string]*meshSession
 	routes                                                       map[enode.ID]map[string]*meshRoute
 	lastRoute                                                    map[enode.ID]string
@@ -174,6 +176,9 @@ func (m *Mesh) maintain() {
 			m.pruneLocked(now)
 			if m.config.PublicGatewayOrigin != "" && now.Sub(m.endpointAdvertisedAt) >= 30*time.Second {
 				_ = m.refreshEndpointLocked(now)
+			}
+			if !m.uplinkAdvertisedAt.IsZero() && now.Sub(m.uplinkAdvertisedAt) >= 30*time.Second {
+				_ = m.refreshUplinkEndpointLocked(now)
 			}
 			var expired []*meshConn
 			for _, c := range m.circuits {
@@ -713,7 +718,7 @@ func (m *Mesh) Endpoint() (MeshAdvertisement, error) {
 	return m.endpoint, nil
 }
 func (m *Mesh) refreshEndpointLocked(now time.Time) error {
-	if m.endpointSequence >= MaxSafeInteger || (!m.endpointAdvertisedAt.IsZero() && now.UnixMilli() < m.endpointAdvertisedAt.UnixMilli()) {
+	if m.endpointSequence >= MaxSafeInteger || (!m.endpointAdvertisedAt.IsZero() && now.UnixMilli() < m.endpointAdvertisedAt.UnixMilli()) || (!m.uplinkAdvertisedAt.IsZero() && now.Before(m.uplinkAdvertisedAt)) {
 		return ErrMeshUnavailable
 	}
 	envelope, err := meshSignEndpoint(m.config.Network, m.config.LocalNode(), m.config.SourceID, m.config.PublicGatewayOrigin, m.bootID, m.endpointSequence+1, now, m.config.SignDigest)
@@ -721,5 +726,47 @@ func (m *Mesh) refreshEndpointLocked(now time.Time) error {
 		return err
 	}
 	m.endpoint, m.endpointSequence, m.endpointAdvertisedAt = envelope, m.endpointSequence+1, now
+	return nil
+}
+
+// UplinkEndpoint uses the native ID as a globally unique source label. The
+// operator's local endpoint retains its configured SourceID. Both envelopes
+// share one sequence counter so an older envelope cannot roll back discovery.
+func (m *Mesh) UplinkEndpoint() (MeshAdvertisement, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.started || m.stopped {
+		return MeshAdvertisement{}, ErrMeshUnavailable
+	}
+	if m.config.PublicGatewayOrigin == "" {
+		return MeshAdvertisement{}, ErrMeshEndpointDisabled
+	}
+	if !m.uplinkAdvertisedAt.IsZero() && time.Now().UnixMilli() >= m.uplinkAdvertisedAt.UnixMilli()+MeshAdvertisementTTL.Milliseconds() {
+		return MeshAdvertisement{}, ErrMeshUnavailable
+	}
+	if m.uplinkAdvertisedAt.IsZero() || time.Since(m.uplinkAdvertisedAt) >= 30*time.Second {
+		if err := m.refreshUplinkEndpointLocked(time.Now()); err != nil {
+			return MeshAdvertisement{}, err
+		}
+	}
+	if time.Now().UnixMilli() >= m.uplinkAdvertisedAt.UnixMilli()+MeshAdvertisementTTL.Milliseconds() {
+		return MeshAdvertisement{}, ErrMeshUnavailable
+	}
+	return m.uplinkEndpoint, nil
+}
+
+func (m *Mesh) refreshUplinkEndpointLocked(now time.Time) error {
+	if m.endpointSequence >= MaxSafeInteger || now.Before(m.endpointAdvertisedAt) || (!m.uplinkAdvertisedAt.IsZero() && now.Before(m.uplinkAdvertisedAt)) {
+		return ErrMeshUnavailable
+	}
+	node := m.config.LocalNode()
+	if node == nil {
+		return ErrMeshUnavailable
+	}
+	envelope, err := meshSignEndpoint(m.config.Network, node, node.ID().String(), m.config.PublicGatewayOrigin, m.bootID, m.endpointSequence+1, now, m.config.SignDigest)
+	if err != nil {
+		return err
+	}
+	m.uplinkEndpoint, m.endpointSequence, m.uplinkAdvertisedAt = envelope, m.endpointSequence+1, now
 	return nil
 }

@@ -10,6 +10,7 @@
     "allowedOrigins": [
       "https://ai-test.make-cph-great-again.community"
     ],
-    "publicGatewayOrigin": "https://ai-test.make-cph-great-again.community"
+    "publicGatewayOrigin": "https://ai-test.make-cph-great-again.community",
+    "gatewayUplink": true
   }
 }

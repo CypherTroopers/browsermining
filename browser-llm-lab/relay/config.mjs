@@ -16,11 +16,11 @@ const bounded = (value, fallback, min, max, label) => {
 const freeze = value => { if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); } return value; };
 const validated=new WeakSet();
 
-/** Common identities and Unix targets are pinned by the operator, never chosen as a client URL. */
+/** Unix targets remain operator-pinned. Opt-in native uplinks authenticate their own identity; no client URL is dialed. */
 export function validateConfig(input) {
   if(validated.has(input))return input;
   fields(input, ['enabled','origin','nativeOrigin','listenHost','listenPort','network','nodes','limits','iceServers',
-    'trustedCountryHeader','trustedClientIpHeader','turn','discovery'], 'gateway configuration');
+    'trustedCountryHeader','trustedClientIpHeader','turn','discovery','sourceUplink'], 'gateway configuration');
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('Invalid admission switch');
   const origin = new URL(input.origin);
   if (origin.origin !== input.origin || origin.username || origin.password ||
@@ -30,7 +30,7 @@ export function validateConfig(input) {
   const nativeOrigin=input.nativeOrigin??input.origin,nativeURL=new URL(nativeOrigin);
   if(nativeURL.origin!==nativeOrigin||nativeURL.username||nativeURL.password||
     !(nativeURL.protocol==='https:'||(nativeURL.protocol==='http:'&&['127.0.0.1','[::1]','localhost'].includes(nativeURL.hostname))))throw new Error('Invalid native Origin pin');
-  if (!Array.isArray(input.nodes) || input.nodes.length > 64 || (input.enabled && !input.nodes.length)) throw new Error('Invalid Common node pins');
+  if (!Array.isArray(input.nodes) || input.nodes.length > 64 || (input.enabled && !input.nodes.length && input.sourceUplink?.enabled!==true)) throw new Error('Invalid Common node pins');
   const nodes = input.nodes.map(node => {
     fields(node,['id','nodeId','enode','socketPath'],'Common node pin');
     if(!id(node.id)||typeof node.nodeId!=='string'||!/^[a-f0-9]{64}$/.test(node.nodeId)||
@@ -71,7 +71,15 @@ export function validateConfig(input) {
   limits.maxSignalConnectionsPerClient=limits.maxSessionsPerClient+2;
   limits.maxSessionTransferBytes=bounded(raw.maxSessionTransferBytes,100*1048576,1048576,100*1048576,'session transfer budget');
   if (limits.maxConnections < 2*limits.maxSessions+8) throw new Error('Connection capacity must cover two sockets per session and eight HTTP slots');
-  if(input.enabled===true&&limits.maxSessions>nodes.length*limits.maxSessionsPerCommon)throw new Error('Session capacity exceeds registered Common capacity');
+  if(input.enabled===true&&input.sourceUplink?.enabled!==true&&limits.maxSessions>nodes.length*limits.maxSessionsPerCommon)throw new Error('Session capacity exceeds registered Common capacity');
+  let sourceUplink=null;
+  if(input.sourceUplink!==undefined&&input.sourceUplink!==null){
+    fields(input.sourceUplink,['enabled','maxSources','maxSourcesPerClient'],'source uplink configuration');
+    if(typeof input.sourceUplink.enabled!=='boolean')throw new Error('Invalid source uplink switch');
+    sourceUplink={enabled:input.sourceUplink.enabled,maxSources:bounded(input.sourceUplink.maxSources,32,1,64,'source capacity'),
+      maxSourcesPerClient:bounded(input.sourceUplink.maxSourcesPerClient,Math.min(4,input.sourceUplink.maxSources??32),1,8,'source client capacity')};
+    if(sourceUplink.enabled&&(origin.protocol!=='https:'||sourceUplink.maxSources+nodes.length>64||sourceUplink.maxSourcesPerClient>sourceUplink.maxSources))throw new Error('Invalid source uplink capacity or origin');
+  }
   const iceServers = input.iceServers ?? [];
   if (!Array.isArray(iceServers) || iceServers.length > 4) throw new Error('Invalid ICE configuration');
   for (const server of iceServers) {
@@ -114,7 +122,7 @@ export function validateConfig(input) {
   if (input.listenHost !== undefined && !['127.0.0.1','::1'].includes(input.listenHost)) throw new Error('Gateway must bind loopback');
   const result=freeze({enabled:input.enabled === true,origin:input.origin,listenHost:input.listenHost ?? '127.0.0.1',
     listenPort:bounded(input.listenPort,8091,1,65535,'listen port'),nativeOrigin,network:structuredClone(input.network),nodes,limits,
-    iceServers:structuredClone(iceServers),turn,discovery,
+    iceServers:structuredClone(iceServers),turn,discovery,sourceUplink,
     trustedCountryHeader:input.trustedCountryHeader ?? null,trustedClientIpHeader:input.trustedClientIpHeader ?? null});
   validated.add(result);return result;
 }

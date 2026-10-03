@@ -13,9 +13,12 @@ const fault=(code,status=400)=>Object.assign(new Error(code),{code,status});
 /** Discovery never dials a client-supplied URL. Only the browser follows signed
  * endpoint claims. Local signed endpoint polling uses existing owner Unix pins.
  * Browser records are self-certified identities, not Common role certificates. */
-export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,takeBytes,takeSignalBytes,sockets,clientOccupancy}) {
+export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,takeBytes,takeSignalBytes,sockets,clientOccupancy,currentNodes=()=>settings.nodes}) {
   const limits=settings.limits,enabled=settings.discovery?.enabled===true;
-  const endpoints=new EndpointCache(settings.network,{now,maxEntries:64});
+  const endpoints=new EndpointCache(settings.network,{now,maxEntries:64}),withdrawnLocal=new Map();
+  // Removing an uplink withdraws it immediately but retains sequence/boot replay
+  // history for its signed lifetime. A remote POST cannot resurrect that source.
+  const visibleEndpoints=()=>endpoints.values().filter(record=>!withdrawnLocal.has(record.nodeId));
   const peers=new Map(),visitors=new Set(),histories=new Map(),publications=new Map(),publicationAttempts=new Map(),originNext=new Map();
   const wss=new WebSocketServer({noServer:true,maxPayload:32768,perMessageDeflate:false,autoPong:false});
   let closed=false,polling=false,nextPoll=0,dirty=false,publicationCursor=0;
@@ -107,10 +110,10 @@ export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,t
   }
   async function refreshNative(){
     if(!enabled||closed||polling||nextPoll>now())return;
-    polling=true;nextPoll=now()+30000;let cursor=0;
-    const poll=async()=>{while(cursor<settings.nodes.length&&!closed){const node=settings.nodes[cursor++];
+    polling=true;nextPoll=now()+30000;let cursor=0;const nodes=currentNodes();
+    const poll=async()=>{while(cursor<nodes.length&&!closed){const node=nodes[cursor++];
       try{
-        const reply=await nativeRequest(node,'endpoint');if(closed||reply.status!==200)continue;
+        const reply=await nativeRequest(node,'endpoint');if(closed||reply.status!==200||!currentNodes().includes(node))continue;
         const envelope=strictJSON(reply.body,8192),record=verifyEndpoint(envelope,settings.network,now());
         if(record.nodeId!==node.nodeId||record.sourceId!==node.id||record.origin!==settings.origin)continue;
         endpoints.add(envelope);
@@ -123,7 +126,7 @@ export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,t
   function pumpPublication(){
     if(!enabled||closed||publications.size>=2)return;
     const origins=settings.discovery.bootstrapOrigins.filter(value=>value!==settings.origin);
-    const local=endpoints.values().filter(record=>record.origin===settings.origin&&settings.nodes.some(node=>node.nodeId===record.nodeId&&node.id===record.sourceId));
+    const local=visibleEndpoints().filter(record=>record.origin===settings.origin&&currentNodes().some(node=>node.nodeId===record.nodeId&&node.id===record.sourceId));
     const total=origins.length*local.length;if(!total)return;
     for(let offset=0;offset<total;offset++){
       const index=publicationCursor++%total,origin=origins[index%origins.length],record=local[Math.floor(index/origins.length)],key=origin+':'+record.nodeId;
@@ -167,7 +170,7 @@ export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,t
       if(req.headers['transfer-encoding']||Number(req.headers['content-length']??0)!==0)throw fault('body_denied');
       const value={version:1,network:settings.network,endpoints:[],peers:[]};
       let size=Buffer.byteLength(JSON.stringify(value));
-      for(const item of endpoints.values()){
+      for(const item of visibleEndpoints()){
         const bytes=Buffer.byteLength(JSON.stringify(item.envelope));if(size+bytes>262000)break;value.endpoints.push(item.envelope);size+=bytes+1;
       }
       for(const visitor of peers.values()){
@@ -256,7 +259,7 @@ export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,t
   }
   function sweep(){
     if(closed||!enabled)return;
-    endpoints.prune();for(const [id,history] of histories)if(!peers.has(id)&&history.expiresAt<=now())histories.delete(id);void refreshNative();
+    endpoints.prune();for(const [id,expiry] of withdrawnLocal)if(expiry<=now())withdrawnLocal.delete(id);for(const [id,history] of histories)if(!peers.has(id)&&history.expiresAt<=now())histories.delete(id);void refreshNative();
     for(const visitor of visitors){
       if(visitor.record&&visitor.record.expiresAt<=now()){metrics.expired++;terminate(visitor);continue;}
       if(!visitor.record&&visitor.challenge.expiresAt<=now()){terminate(visitor);continue;}
@@ -274,7 +277,8 @@ export function createDiscovery({settings,now,makeBucket,nativeRequest,respond,t
   }
   const timer=setInterval(sweep,100);timer.unref();
   return {publication,publicationOrigin,handle,upgrade,sweep,refreshNative,countClient,
-    stats:()=>({enabled,endpoints:endpoints.values().length,peers:peers.size,visitors:visitors.size,replayEntries:histories.size,publishing:publications.size,publicationSlots:publicationAttempts.size,queuedBytes:[...visitors].reduce((n,v)=>n+v.queueBytes,0),...metrics,rejectionReasons:{...rejectionReasons}}),
-    close:async()=>{if(closed)return;closed=true;clearInterval(timer);for(const controller of publications.values())controller.abort();for(const visitor of [...visitors])terminate(visitor);endpoints.records.clear();histories.clear();publicationAttempts.clear();originNext.clear();await new Promise(resolve=>wss.close(resolve));},
+    addLocalEndpoint:envelope=>{const record=endpoints.add(envelope);withdrawnLocal.delete(record.nodeId);return record;},removeLocalEndpoint:nodeId=>{const record=endpoints.get(nodeId);if(record)withdrawnLocal.set(nodeId,record.expiresAt+10000);},
+    stats:()=>({enabled,endpoints:visibleEndpoints().length,peers:peers.size,visitors:visitors.size,replayEntries:histories.size,publishing:publications.size,publicationSlots:publicationAttempts.size,queuedBytes:[...visitors].reduce((n,v)=>n+v.queueBytes,0),...metrics,rejectionReasons:{...rejectionReasons}}),
+    close:async()=>{if(closed)return;closed=true;clearInterval(timer);for(const controller of publications.values())controller.abort();for(const visitor of [...visitors])terminate(visitor);endpoints.records.clear();withdrawnLocal.clear();histories.clear();publicationAttempts.clear();originNext.clear();await new Promise(resolve=>wss.close(resolve));},
   };
 }

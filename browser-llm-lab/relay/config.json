@@ -49,5 +49,10 @@
     "allowedOrigins": [
       "https://ai-test.make-cph-great-again.community"
     ]
+  },
+  "sourceUplink": {
+    "enabled": true,
+    "maxSources": 32,
+    "maxSourcesPerClient": 4
   }
 }

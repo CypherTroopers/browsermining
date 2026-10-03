@@ -1,0 +1,22 @@
+# Cypherium local chain databases
+chaindb/
+chaindb*/
+chaindbname/
+chaindbname*/
+
+# Local chain databases
+chaindb*
+chaindb*/
+
+# Local start scripts
+start-cypher*.sh
+reset-chain.sh
+status.sh
+start-cyphermine.sh
+unlock.sh
+init.sh
+# Ephemeral native-build staging
+build/stage/
+
+# Local mining script
+start-mining.sh

@@ -18,6 +18,7 @@
 package eth
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
@@ -78,7 +79,7 @@ type Ethereum struct {
 	// DB interfaces
 	chainDb        ethdb.Database // Block chain database
 	txOutboxDb     ethdb.Database // Rebuildable TxQUIC outbox projection (bridge nodes only)
-	txIngressDb    ethdb.Database // Rebuildable TxQUIC receiver projection (committee nodes only)
+	txIngressDb    ethdb.Database // Rebuildable TxQUIC receiver projection (prepared before miner.start)
 	txIngressWALDb ethdb.Database // Role-independent transaction ingress authority
 
 	eventMux       *event.TypeMux
@@ -102,7 +103,7 @@ type Ethereum struct {
 	p2pServer *p2p.Server
 	extIP     net.IP
 	lock      sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
-	// Serializes the RPC-visible reconfig/PoW-listener/miner state transition.
+	// Serializes the RPC-visible reconfig/TxQUIC/PoW-listener/miner transition.
 	miningLifecycleMu sync.Mutex
 
 	consensusServicePendingLogsFeed *event.Feed
@@ -355,7 +356,7 @@ func New(stack *node.Node, config *Config) (*Ethereum, error) {
 			return nil, fmt.Errorf("open TxQUIC outbox database: %w", err)
 		}
 	}
-	if config.TxQUIC.Enabled {
+	if config.TxQUIC.Enabled || config.TxQUIC.prepareIngress {
 		ingressCache, ingressHandles := config.DatabaseCache/16, config.DatabaseHandles/16
 		if ingressCache < 16 {
 			ingressCache = 16
@@ -519,7 +520,7 @@ func New(stack *node.Node, config *Config) (*Ethereum, error) {
 				CommitteePublicKeys: committeePublicKeys,
 			}, nil
 		})
-		if config.TxQUIC.Enabled {
+		if config.TxQUIC.Enabled || config.TxQUIC.prepareIngress {
 			if err := eth.txQUICIngress.SetFHSReceiptSigner(eth.reconfig.TxQUICReceiptPublicKey, eth.reconfig.SignTxQUICReceipt); err != nil {
 				return nil, err
 			}
@@ -722,6 +723,74 @@ func (s *Ethereum) startPoWResultTransport() error {
 func (s *Ethereum) stopPoWResultTransport() {
 	if s != nil && s.candidatePool != nil {
 		s.candidatePool.StopPoWResultTransport()
+	}
+}
+
+func (s *Ethereum) checkCommonOnlyMiningIdentity(public []byte) error {
+	if s == nil || s.config == nil || !s.config.CommonOnly {
+		return nil
+	}
+	if s.reconfig == nil {
+		return fmt.Errorf("cannot verify Common-only mining identity without consensus service")
+	}
+	route, err := s.reconfig.CurrentFHSRoute()
+	if err != nil {
+		return fmt.Errorf("verify Common-only mining identity: %w", err)
+	}
+	if route == nil {
+		return fmt.Errorf("cannot verify Common-only mining identity without current committee")
+	}
+	for _, member := range route.Committee {
+		if member != nil && bytes.Equal(public, common.FromHex(member.Public)) {
+			return fmt.Errorf("browser services require a Common-only node; committee mining identity is not allowed")
+		}
+	}
+	return nil
+}
+
+// startTxQUICReceiver runs only after MinerStart has validated the local BLS
+// key and recovered the current committee. Public configuration and listening
+// ports are not evidence of committee membership.
+func (s *Ethereum) startTxQUICReceiver() error {
+	if s == nil || s.txQUICIngress == nil || s.reconfig == nil {
+		return nil
+	}
+	q := s.txQUICIngress
+	if !q.config.FairHotstuff || (!q.config.Enabled && !q.config.prepareIngress) {
+		return nil
+	}
+	public, err := s.reconfig.TxQUICReceiptPublicKey()
+	if err != nil {
+		return fmt.Errorf("resolve verified TxQUIC identity: %w", err)
+	}
+	route, err := s.reconfig.CurrentFHSRoute()
+	if err != nil {
+		return fmt.Errorf("resolve current TxQUIC committee: %w", err)
+	}
+	if route == nil {
+		return fmt.Errorf("current TxQUIC committee is unavailable")
+	}
+	for _, member := range route.Committee {
+		if member != nil && bytes.Equal(public, common.FromHex(member.Public)) {
+			// WAL recovery in MinerStart can update the canonical committee, so
+			// enforce the browser role restriction again after recovery.
+			if s.config != nil && s.config.CommonOnly {
+				return fmt.Errorf("browser services require a Common-only node; committee receiver is not allowed")
+			}
+			if !s.reconfig.ServiceIsRunning() {
+				return fmt.Errorf("TxQUIC committee consensus service is not running")
+			}
+			return q.StartReceiver()
+		}
+	}
+	// A valid Common mining identity is allowed to be outside the committee.
+	// Keep its durable bridge active without opening a validator receiver.
+	return nil
+}
+
+func (s *Ethereum) stopTxQUICReceiver() {
+	if s != nil && s.txQUICIngress != nil {
+		s.txQUICIngress.StopReceiver()
 	}
 }
 

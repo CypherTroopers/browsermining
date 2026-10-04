@@ -7,7 +7,7 @@ LightServ = 0
 
 [Eth.TxQUIC]
 AutoRole = true
-CommitteePublicKey = "3912d236e16d97b70244a6c3f0693c8ff855bca8771b521bb3af948f0c682a15a8ca1a90265f7db37dacd2621e389c1cc8526eca9efd31a66e6ce6debdb1560b"
+# miner.start supplies and verifies the existing BLS identity before ingress opens.
 
 [Eth.Relay]
 Enabled = false

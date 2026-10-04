@@ -21,8 +21,11 @@ func TestCommonRelayOperatorExamplesDecode(t *testing.T) {
 			if (role == "gateway") != cfg.Eth.Relay.Gateway {
 				t.Fatal("gateway opt-in lost")
 			}
-			if role == "committee" && cfg.Eth.TxQUIC.CommitteePublicKey == "" {
-				t.Fatal("committee identity missing")
+			if !cfg.Eth.TxQUIC.AutoRole {
+				t.Fatal("verified miner identity auto-role selection disabled")
+			}
+			if cfg.Eth.TxQUIC.CommitteePublicKey != "" {
+				t.Fatal("example still requires a separate committee identity hint")
 			}
 		})
 	}

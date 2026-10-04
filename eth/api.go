@@ -464,26 +464,51 @@ func (api *PrivateMinerAPI) Start(threads *int, addr common.Address, password st
 		log.Error("Cannot start reconfig without correct public key")
 		return "", errors.New("missing public key")
 	}
+	if err := api.e.checkCommonOnlyMiningIdentity(pubKey); err != nil {
+		return "", err
+	}
 	log.Warn("pubKey", "pubKey", server.Public) //, "prvKey", server.Private)
 	log.Warn("exip", "ip", api.e.ExtIP(), "port", api.e.config.RnetPort)
 	server.Ip = api.e.ExtIP().String()
 	server.Port = api.e.config.RnetPort
 	server.Coinbase = eb.Hex()
-	if err := api.e.reconfig.MinerStart(server); err != nil {
-		return "", err
-	}
-	if err := api.e.startPoWResultTransport(); err != nil {
-		if stopErr := api.e.reconfig.MinerStop(); stopErr != nil {
-			log.Warn("Failed to roll back reconfig after PoW result transport start failure", "err", stopErr)
-		}
-		return "", fmt.Errorf("start fixed-mode PoW result transport: %w", err)
-	}
-
-	if err := api.e.StartMining(miningThreads, true, eb, pubKey); err != nil {
+	// Drain every receiver operation before MinerStart can replace the signing
+	// identity. WAL/outbox workers belong to the node and remain alive.
+	api.e.stopTxQUICReceiver()
+	rollback := func() {
+		api.e.stopTxQUICReceiver()
 		api.e.stopPoWResultTransport()
 		if stopErr := api.e.reconfig.MinerStop(); stopErr != nil {
 			log.Warn("Failed to roll back reconfig after mining start failure", "err", stopErr)
 		}
+	}
+	if err := api.e.reconfig.MinerStart(server); err != nil {
+		rollback()
+		return "", err
+	}
+	// Recovery may have installed a newer committee. Apply this restriction
+	// even when the operator explicitly disabled TxQUIC automatic activation.
+	if api.e.config.CommonOnly {
+		verifiedPublic, err := api.e.reconfig.TxQUICReceiptPublicKey()
+		if err == nil {
+			err = api.e.checkCommonOnlyMiningIdentity(verifiedPublic)
+		}
+		if err != nil {
+			rollback()
+			return "", err
+		}
+	}
+	if err := api.e.startPoWResultTransport(); err != nil {
+		rollback()
+		return "", fmt.Errorf("start fixed-mode PoW result transport: %w", err)
+	}
+	if err := api.e.startTxQUICReceiver(); err != nil {
+		rollback()
+		return "", fmt.Errorf("start authenticated TxQUIC receiver: %w", err)
+	}
+
+	if err := api.e.StartMining(miningThreads, true, eb, pubKey); err != nil {
+		rollback()
 		return "", err
 	}
 	return "Mining started", nil
@@ -500,6 +525,7 @@ func (api *PrivateMinerAPI) Stop() {
 	if th, ok := api.e.engine.(threaded); ok {
 		th.SetThreads(-1)
 	}
+	api.e.stopTxQUICReceiver()
 	api.e.stopPoWResultTransport()
 	api.e.StopMining()
 	api.e.reconfig.MinerStop()

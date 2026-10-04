@@ -791,11 +791,12 @@ func (s *Service) sendNewViewMsgAfterReplay(curN uint64) {
 		viewHash == s.lastStartNewViewHash &&
 		!s.lastStartNewViewAt.IsZero() &&
 		now.Sub(s.lastStartNewViewAt) < startNewViewDedupWindow {
+		since := now.Sub(s.lastStartNewViewAt)
 		s.muStartNewView.Unlock()
 		log.Debug("suppress duplicate start-new-view",
 			"curN", curN,
 			"viewHash", viewHash,
-			"since", now.Sub(s.lastStartNewViewAt))
+			"since", since)
 		return
 	}
 	s.lastStartNewViewN = curN

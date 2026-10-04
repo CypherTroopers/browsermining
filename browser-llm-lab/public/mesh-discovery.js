@@ -192,16 +192,20 @@ export function verifySignal(envelope, record, network, now = Date.now()) {
   check(payload.from === browser.peerId && payload.fromSessionId === browser.sessionId, 'Signal is for a stale browser identity or generation.', 'wrong_session');
   verifyBytes(signedRecord.envelope, DISCOVERY_DOMAINS.signal, raw, browser.publicKey); return payload;
 }
-function challengeBytes(challenge, record, now) {
+function challengeBytes(challenge, record, now, clockSkew = 0) {
   exactFields(challenge, ['nonce', 'origin', 'expiresAt']);
-  check(nodeId(challenge.nonce) && integer(challenge.expiresAt) && challenge.expiresAt > now && challenge.expiresAt <= now + 5000, 'Invalid or expired rendezvous challenge.', 'stale_challenge');
+  check(integer(now) && nodeId(challenge.nonce) && integer(challenge.expiresAt, 1) && challenge.expiresAt > now - clockSkew &&
+    challenge.expiresAt <= now + DISCOVERY_LIMITS.challengeTTL + clockSkew, 'Invalid or expired rendezvous challenge.', 'stale_challenge');
   safeGatewayOrigin(challenge.origin);
   return encoder.encode(JSON.stringify({ nonce: challenge.nonce, origin: challenge.origin, expiresAt: challenge.expiresAt, recordDigest: hex(keccak_256(record.raw)) }));
 }
 export function signChallenge(challenge, recordEnvelope, identity, now = Date.now()) {
   const parsed = parseEnvelope(recordEnvelope), record = verifyBrowserRecord(recordEnvelope, parsed.payload.network, now);
   check(record.peerId === identity.peerId && record.publicKey === identity.publicKeyHex && record.rendezvous.includes(challenge.origin), 'Challenge is not bound to this browser or rendezvous.', 'wrong_session');
-  return signBytes(DISCOVERY_DOMAINS.challenge, challengeBytes(challenge, record, now), identity);
+  // The browser clock can differ from the issuing gateway. The challenge has
+  // no issuedAt, so only the gateway can enforce its exact five-second lease.
+  // Tolerate the existing bounded discovery skew here; verification stays strict.
+  return signBytes(DISCOVERY_DOMAINS.challenge, challengeBytes(challenge, record, now, DISCOVERY_LIMITS.clockSkew), identity);
 }
 export function verifyChallenge(challenge, recordEnvelope, signatureHex, network, now = Date.now()) {
   const record = verifyBrowserRecord(recordEnvelope, network, now);

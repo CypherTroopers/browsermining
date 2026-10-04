@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/cypherium/cypher/core"
 	"github.com/cypherium/cypher/core/types"
 	"github.com/cypherium/cypher/crypto"
+	"github.com/cypherium/cypher/crypto/bls"
 	"github.com/cypherium/cypher/eth/downloader"
 	"github.com/cypherium/cypher/ethdb/memorydb"
 	"github.com/cypherium/cypher/node"
@@ -24,6 +27,235 @@ import (
 	"github.com/cypherium/cypher/reconfig/bftview"
 	"github.com/cypherium/cypher/rlp"
 )
+
+// This exercises the production constructor, node startup, keystore password
+// check and miner RPC lifecycle with no per-node TxQUIC identity configuration.
+// All committee endpoints are loopback fixtures. Members do not mine, and the
+// Common case disables reward lookup so it cannot create work or allocate a DAG.
+func TestMinerStartActivatesTxQUICFromVerifiedIdentity(t *testing.T) {
+	previousCoinbase := bftview.GetServerCoinBase()
+	previousAddress := bftview.GetServerAddress()
+	previousPublic := bftview.GetServerInfo(bftview.PublicKey)
+	bftview.SetServerCoinBase(common.Address{})
+	bftview.SetServerInfo("", "")
+	t.Cleanup(func() {
+		bftview.SetServerCoinBase(previousCoinbase)
+		bftview.SetServerInfo(previousAddress, previousPublic)
+	})
+	stack, err := node.New(&node.Config{
+		Name: "miner-txquic-test", DataDir: t.TempDir(), NoUSB: true, UseLightweightKDF: true,
+		P2P: p2p.Config{NoDiscovery: true, MaxPeers: 0, ListenAddr: "127.0.0.1:0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stack.Close() })
+	manager := stack.AccountManager()
+	store := manager.Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
+	newAccount := func() accounts.Account {
+		events := make(chan accounts.WalletEvent, 1)
+		sub := manager.Subscribe(events)
+		defer sub.Unsubscribe()
+		account, err := store.NewAccount("test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.Kind != accounts.WalletArrived || !event.Wallet.Contains(account) {
+				t.Fatal("account manager observed an unrelated wallet event")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("account manager did not discover the test account")
+		}
+		return account
+	}
+	member, commonMiner := newAccount(), newAccount()
+	public, _, err := store.GetKeyPair(member, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile("../genesis.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := new(core.Genesis)
+	if err := json.Unmarshal(encoded, genesis); err != nil {
+		t.Fatal(err)
+	}
+	// Reserve both transports before selecting a base port. The TxQUIC socket
+	// remains occupied for the first start to exercise rollback after BLS setup.
+	var rnetPort int
+	var occupied net.PacketConn
+	for attempt := 0; attempt < 100; attempt++ {
+		base, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rnetPort = base.LocalAddr().(*net.UDPAddr).Port
+		if rnetPort+2006 > 65535 {
+			base.Close()
+			continue
+		}
+		powAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(rnetPort+1))
+		powUDP, udpErr := net.ListenPacket("udp4", powAddress)
+		powTCP, tcpErr := net.Listen("tcp4", powAddress)
+		txAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(rnetPort+2000))
+		occupied, err = net.ListenPacket("udp4", txAddress)
+		base.Close()
+		if powUDP != nil {
+			powUDP.Close()
+		}
+		if powTCP != nil {
+			powTCP.Close()
+		}
+		if udpErr == nil && tcpErr == nil && err == nil {
+			break
+		}
+		if occupied != nil {
+			occupied.Close()
+			occupied = nil
+		}
+	}
+	if occupied == nil {
+		t.Fatal("could not reserve local consensus/PoW/TxQUIC ports")
+	}
+	t.Cleanup(func() { occupied.Close() })
+	genesis.Config.GenCommittee = make(params.GenesisCommittee, 4)
+	for index := 0; index < 4; index++ {
+		secret := new(bls.SecretKey)
+		secret.SetByCSPRNG()
+		genesis.Config.GenCommittee[index] = common.Cnode{
+			Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(rnetPort+2*index)),
+			Public:  secret.GetPublicKey().SerializeToHexStr(), CoinBase: common.Address{byte(index + 1)}.Hex(),
+		}
+	}
+	genesis.Config.GenCommittee[0] = common.Cnode{
+		Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(rnetPort)),
+		Public:  common.HexString(public), CoinBase: member.Address.Hex(),
+	}
+	genesis.Mixhash, err = params.FairHotstuffGenesisCommitment(genesis.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig
+	config.Genesis = genesis
+	config.GenesisKey = &core.GenesisKey{Config: genesis.Config, Difficulty: big.NewInt(1)}
+	config.NetworkId = genesis.Config.ChainID.Uint64()
+	config.SyncMode, config.ExternalIp = downloader.FullSync, "127.0.0.1"
+	config.RnetPort = strconv.Itoa(rnetPort)
+	config.DatabaseCache, config.DatabaseHandles = 16, 16
+	config.TrieCleanCache, config.TrieDirtyCache, config.SnapshotCache = 0, 0, 0
+	config.TxQUIC = testTxQUICConfig()
+	config.TxQUIC.AutoRole, config.TxQUIC.Addr = true, "127.0.0.1"
+	config.TxQUIC.OutboxRetryMin, config.TxQUIC.OutboxRetryMax = time.Second, time.Second
+	service, err := New(stack, &config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stack.Start(); err != nil {
+		t.Fatalf("startup must not require an available receiver port or identity hint: %v", err)
+	}
+	api := NewPrivateMinerAPI(service)
+	t.Cleanup(api.Stop)
+	q := service.txQUICIngress
+	if q == nil || q.outbox == nil || q.ingress == nil || q.wal == nil {
+		t.Fatal("automatic role startup did not prepare both durable ingress paths")
+	}
+	if config.TxQUIC.CommitteePublicKey != "" {
+		t.Fatal("fixture unexpectedly provided a separate committee public key")
+	}
+	assertReceiver := func(want bool) {
+		t.Helper()
+		q.receiverMu.Lock()
+		have := q.listener != nil
+		q.receiverMu.Unlock()
+		if have != want {
+			t.Fatalf("TxQUIC receiver active = %t, want %t", have, want)
+		}
+	}
+	assertReceiver(false)
+	outbox, wal := q.outbox, q.wal
+	storePending := func(nonce uint64) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		payload := testTxQUICBatchPayload(t, q.config, testTxQUICTransaction(nonce, 0))
+		if _, err := outbox.StoreSync(ctx, payload); err != nil {
+			t.Fatalf("durable outbox stopped across miner transition: %v", err)
+		}
+	}
+	assertEngine := func(wantPending int) {
+		t.Helper()
+		if service.txQUICIngress != q || q.outbox != outbox || q.wal != wal || q.ctx.Err() != nil {
+			t.Fatal("miner transition replaced or canceled the node ingress engine")
+		}
+		if pending, _ := outbox.Pending(); pending != wantPending {
+			t.Fatalf("pending outbox batches = %d, want %d", pending, wantPending)
+		}
+	}
+	storePending(3000)
+	threads := -1
+	service.config.CommonOnly = true
+	if _, err := api.Start(&threads, member.Address, "test"); err == nil {
+		t.Fatal("Common-only node accepted a committee mining identity")
+	}
+	if service.IsMining() || service.ServiceIsRunning() {
+		t.Fatal("Common-only identity rejection started mining or consensus")
+	}
+	assertReceiver(false)
+	assertEngine(1)
+	service.config.CommonOnly = false
+	if _, err := api.Start(&threads, member.Address, "wrong password"); err == nil {
+		t.Fatal("invalid keystore password started mining")
+	}
+	assertReceiver(false)
+	if _, err := api.Start(&threads, member.Address, "test"); err == nil || !strings.Contains(err.Error(), "TxQUIC") {
+		t.Fatalf("occupied receiver port did not fail miner.start: %v", err)
+	}
+	if service.IsMining() || service.ServiceIsRunning() {
+		t.Fatal("receiver bind failure left mining or consensus running")
+	}
+	assertReceiver(false)
+	assertEngine(1)
+	if err := occupied.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for iteration := 0; iteration < 2; iteration++ {
+		if _, err := api.Start(&threads, member.Address, "test"); err != nil {
+			t.Fatalf("member start %d without a public-key hint failed: %v", iteration, err)
+		}
+		assertReceiver(true)
+		if !service.IsMining() || !service.ServiceIsRunning() || bftview.IamMember() != 0 {
+			t.Fatal("validated member was not active after miner.start")
+		}
+		certificate, err := q.serverCertificate(context.Background())
+		if err != nil || certificate.Leaf == nil {
+			t.Fatalf("receiver could not build its authenticated committee certificate: %v", err)
+		}
+		assertEngine(iteration + 1)
+		api.Stop()
+		assertReceiver(false)
+		storePending(uint64(3001 + iteration))
+		assertEngine(iteration + 2)
+	}
+	// Same endpoint and port, different verified key: role is not inferred from
+	// genesis address matching, the old public-key hint, or the previous identity.
+	// An absent registration normally falls back to the mining account. Disable
+	// the registry itself to stop candidate creation before the real PoW engine.
+	service.commonRPCRewards = nil
+	if _, err := service.PoWRewardRecipient(commonMiner.Address); err == nil {
+		t.Fatal("Common test miner must not be able to create PoW work")
+	}
+	if _, err := api.Start(&threads, commonMiner.Address, "test"); err != nil {
+		t.Fatalf("Common miner start failed: %v", err)
+	}
+	assertReceiver(false)
+	if bftview.IamMember() >= 0 || service.ServiceIsRunning() {
+		t.Fatal("nonmember became a committee service by sharing its port")
+	}
+	assertEngine(3)
+}
 
 func TestTxQUICPacketAcceptsIndependentSignersWithOptionalFilter(t *testing.T) {
 	config := testTxQUICConfig()

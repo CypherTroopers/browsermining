@@ -2,6 +2,8 @@
 
 Worktree: `/root/cypher`, branch `FHS-D`. Existing running targets are `chaindb0`…`chaindb6` and `chaindbmine`; wrappers are `start-cypher0.sh`…`start-cypher6.sh` and `start-cyphermine.sh`. Committee RLPx ports are 6000…6006 and rnet ports are 7102,7104,7106,7108,7110,7112,7114. Common miner ports are 6099 / 7155. Network ID is 10101919.
 
+The fresh-datadir and initialization steps below concern the earlier v3-to-v4 genesis/relay cutover. The TxQUIC automatic-role correction alone does not change the genesis or wire protocol and requires no reinitialization or additional committee configuration files. With `AutoRole = true`, use the existing startup configuration and verified `miner.start` key-loading procedure; a current committee member then opens its TxQUIC receiver.
+
 Do not execute `init.sh`, `reset-chain.sh`, the existing wrappers, or `start-mining.sh` as part of this upgrade without confirming exact processes, data destinations, key handling, public IPs and finalized configs. Existing wrappers reference the old binary and committee-star `static-nodes.toml`. No existing process or data directory was changed.
 
 ## Candidate and genesis
@@ -46,7 +48,7 @@ Repeat only for the explicitly approved targets. The exact corresponding foregro
   --nat extip:APPROVED_PUBLIC_IP --gcmode archive console
 ```
 
-For committee i use the matching config/datadir, port `6000+i`, rnet `7102+2*i`. For the common miner use `common-mine.toml`, `chaindbmine`, port 6099 and rnet 7155. A common config must enable Relay but not Gateway and must not set CommitteePublicKey. Selected gateway operators explicitly enable Gateway and arrange at least two gateway-reaching paths within TTL. Committee configs need their own canonical BLS public identity hint and the other core enode pins. Keep RPC bound locally unless separately reviewed; do not copy the old wildcard RPC/unlock settings.
+For committee i use the matching config/datadir, port `6000+i`, rnet `7102+2*i`. For the common miner use `common-mine.toml`, `chaindbmine`, port 6099 and rnet 7155. A common config using the relay overlay must enable Relay but not Gateway. Selected gateway operators explicitly enable Gateway and arrange at least two gateway-reaching paths within TTL. Committee configs pin the other core enodes and keep `TxQUIC.AutoRole = true`; `miner.start` supplies the verified BLS identity and determines membership from the current canonical committee. Omit the deprecated `CommitteePublicKey` hint. Keep RPC bound locally unless separately reviewed; do not copy the old wildcard RPC/unlock settings.
 
 Starting consensus/mining requires the existing approved account/BLS setup and private IPC procedure; do not copy passwords from old scripts into new commands or logs. Confirm that procedure and all target process identities before launch. Then check genesis agreement, block/keyblock sync, pinned reconnect, transaction committee receipts, PoW admission and reward identity, failover and resource metrics.
 

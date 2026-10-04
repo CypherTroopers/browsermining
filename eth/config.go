@@ -151,8 +151,8 @@ func (c *Config) ColossusX() *colossusX.Config { return &c.colossusX }
 //go:generate gencodec -type Config -formats toml -out gen_config.go
 
 type TxQUICConfig struct {
-	// Public identity hint for startup role selection, checked against genesis.
-	// The actual ingress signer must independently prove the corresponding key.
+	// Deprecated: retained for older TOML files. AutoRole derives the receiver
+	// identity from the verified miner.start key and the current FHS committee.
 	CommitteePublicKey string      `toml:",omitempty"`
 	ChainID            uint64      `toml:"-"`
 	GenesisHash        common.Hash `toml:"-"`
@@ -161,6 +161,12 @@ type TxQUICConfig struct {
 	Enabled       bool `toml:",omitempty"`
 	AutoRole      bool `toml:",omitempty"`
 	BridgeEnabled bool `toml:",omitempty"`
+
+	// AutoRole prepares durable receiver resources at node startup, but waits
+	// for miner.start to establish the authenticated local committee identity.
+	// These process-local flags are never operator configuration or wire data.
+	prepareIngress     bool
+	deferReceiverStart bool
 
 	BridgeQueueSize         int           `toml:",omitempty"`
 	BridgeQueueMaxBytes     int64         `toml:",omitempty"`
@@ -233,6 +239,10 @@ type Config struct {
 
 	NetworkId uint64
 	SyncMode  downloader.SyncMode
+
+	// CommonOnly is set by embedded browser services before construction. It
+	// also applies when a later miner.start selects a local consensus identity.
+	CommonOnly bool `toml:"-"`
 
 	DiscoveryURLs []string
 

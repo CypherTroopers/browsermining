@@ -146,7 +146,9 @@ func (self *worker) start() {
 	self.powResultCtx, self.powResultCancel = context.WithCancel(context.Background())
 	self.keyHeadSub = self.eth.KeyBlockChain().SubscribeChainEvent(self.keyHeadCh)
 
-	go self.autoCommit()
+	// Each loop must observe its own subscription. A later miner.start can
+	// replace keyHeadSub before the previous loop observes its unsubscribe.
+	go self.autoCommit(self.keyHeadSub)
 
 	for agent := range self.agents {
 		agent.Start()
@@ -195,7 +197,7 @@ func (self *worker) unregister(agent Agent) {
 	agent.Stop()
 }
 
-func (self *worker) autoCommit() {
+func (self *worker) autoCommit(subscription event.Subscription) {
 	log.Info("Miner worker start auto-committing")
 	if bftview.IamMember() < 0 {
 		self.commitNewWork()
@@ -216,10 +218,12 @@ func (self *worker) autoCommit() {
 				} else {
 					log.Info("User has not permitted  to start")
 				}
+				// stop unsubscribed this generation; start owns a new loop.
+				return
 			}
 
 		// Err() channel will be closed when unsubscribing.
-		case <-self.keyHeadSub.Err():
+		case <-subscription.Err():
 			log.Info("Miner worker stop auto-committing")
 			return
 		}

@@ -46,7 +46,9 @@ There are no global route advertisements or a proof that a random graph reaches 
 
 ## Operator examples and validation
 
-`examples/common.toml`, `gateway.toml`, and `committee.toml` are additive templates parsed by the real CLI TOML loader in `cmd/cypher/common_relay_config_test.go`. All enodes use documentation TEST-NET addresses and disposable public test identities: replace them before use. The committee example's `CommitteePublicKey` is the first existing genesis BLS public key; choose the matching public key for each actual committee operator and keep the existing private signing setup. AutoRole now requires that explicit public identity hint; matching an rnet port alone no longer makes a node a validator. Actual signing still requires the canonical BLS signer. Keep a common node's hint absent. CLI settings can override TOML: inspect the final operator configuration before a later authorized launch.
+`examples/common.toml`, `gateway.toml`, and `committee.toml` are additive templates parsed by the real CLI TOML loader in `cmd/cypher/common_relay_config_test.go`. All enodes use documentation TEST-NET addresses and disposable public test identities: replace them before use. CLI settings can override TOML: inspect the final operator configuration before a later authorized launch.
+
+With `TxQUIC.AutoRole = true`, startup prepares the durable TxQUIC engine and Common bridge but leaves the committee receiver closed. The existing `miner.start` flow verifies the local BLS key, then checks it against the current canonical committee and starts the receiver at the matching endpoint's TxQUIC port. A nonmember remains a Common node, including when it uses the same rnet port as a committee member on another machine. `CommitteePublicKey` remains accepted for old TOML compatibility but is ignored by automatic role selection; no separate identity configuration file is required. Keep using the existing account/BLS key-loading procedure. `miner.stop` closes and drains the receiver while the node-global WAL and outbox remain available for pending work and a subsequent `miner.start`.
 
 Critical tests:
 

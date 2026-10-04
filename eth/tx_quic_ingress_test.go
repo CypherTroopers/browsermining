@@ -6234,17 +6234,19 @@ func TestApplyFixedCommitteeAutoRoleUsesDynamicFHSRouting(t *testing.T) {
 	}
 	commonConfig := TxQUICConfig{AutoRole: true, PortOffset: 2000}
 	commonConfig.ApplyFixedCommitteeAutoRole(commonNode)
-	if commonConfig.Enabled || !commonConfig.BridgeEnabled || commonConfig.HTTP3Enabled {
+	if commonConfig.Enabled || !commonConfig.BridgeEnabled || commonConfig.HTTP3Enabled || !commonConfig.prepareIngress || !commonConfig.deferReceiverStart {
 		t.Fatalf("common-node FHS role ingress/bridge/http3 = %t/%t/%t", commonConfig.Enabled, commonConfig.BridgeEnabled, commonConfig.HTTP3Enabled)
 	}
 
 	validator := &params.ChainConfig{
 		GenCommittee: committee, RnetPort: "7104", FixedCommittee: true, FairHotstuff: true,
 	}
-	validatorConfig := TxQUICConfig{AutoRole: true, PortOffset: 2000, CommitteePublicKey: committee[1].Public}
-	validatorConfig.ApplyFixedCommitteeAutoRole(validator)
-	if !validatorConfig.Enabled || validatorConfig.BridgeEnabled || validatorConfig.HTTP3Enabled || validatorConfig.Port != 9104 {
-		t.Fatalf("validator FHS role ingress/bridge/http3 = %t/%t/%t, port = %d", validatorConfig.Enabled, validatorConfig.BridgeEnabled, validatorConfig.HTTP3Enabled, validatorConfig.Port)
+	for _, hint := range []string{"", committee[1].Public, "untrusted identity hint"} {
+		validatorConfig := TxQUICConfig{AutoRole: true, PortOffset: 2000, CommitteePublicKey: hint}
+		validatorConfig.ApplyFixedCommitteeAutoRole(validator)
+		if validatorConfig.Enabled || !validatorConfig.BridgeEnabled || validatorConfig.HTTP3Enabled || validatorConfig.Port != 9104 || !validatorConfig.prepareIngress || !validatorConfig.deferReceiverStart {
+			t.Fatalf("unverified identity hint %q changed startup role: %+v", hint, validatorConfig)
+		}
 	}
 }
 

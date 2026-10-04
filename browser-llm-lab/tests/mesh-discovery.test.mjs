@@ -167,6 +167,32 @@ test('gateway challenge authenticates key possession, nonce, exact origin and si
   assert.throws(() => verifyChallenge(challenge, browser({ browserId: 'ee'.repeat(16) }), signature, network, now), errorCode('invalid_signature'));
   assert.throws(() => verifyChallenge({ ...challenge, origin: 'https://other.example.org' }, record, signature, network, now), errorCode('unsafe_origin'));
   assert.throws(() => verifyChallenge(challenge, record, signature, network, now + 5000), errorCode('stale_challenge'));
-  assert.throws(() => signChallenge({ ...challenge, expiresAt: now + 5001 }, record, identity, now), errorCode('stale_challenge'));
+  const beyondServerLease = { ...challenge, expiresAt: now + 5001 };
+  const clientSignature = signChallenge(beyondServerLease, record, identity, now);
+  assert.throws(() => verifyChallenge(beyondServerLease, record, clientSignature, network, now), errorCode('stale_challenge'));
   assert.throws(() => signChallenge(challenge, record, other, now), errorCode('wrong_session'));
+});
+
+test('browser challenge signing tolerates bounded clock differences while gateway expiry stays strict', () => {
+  const challenge = { nonce: 'aa'.repeat(32), origin: 'https://gateway.example.org', expiresAt: now + 5000 };
+  for (const offset of [-10000, -1000, 0, 6000, 10000]) {
+    const clientNow = now + offset, record = browser({ issuedAt: clientNow, expiresAt: clientNow + 120000 });
+    const signature = signChallenge(challenge, record, identity, clientNow);
+    assert.equal(verifyChallenge(challenge, record, signature, network, now).peerId, identity.peerId, `client clock offset ${offset}`);
+    assert.throws(() => verifyChallenge(challenge, record, signature, network, now + 5000), errorCode('stale_challenge'));
+  }
+  const record = browser(), signature = signChallenge(challenge, record, identity, now);
+  assert.equal(signChallenge(challenge, record, identity, now - 1000), signature, 'clock tolerance never changes signed bytes');
+  assert.equal(signChallenge(challenge, record, identity, now + 6000), signature);
+});
+
+test('client challenge tolerance remains finite and does not relax schema or gateway lease checks', () => {
+  const challenge = { nonce: 'aa'.repeat(32), origin: 'https://gateway.example.org', expiresAt: now + 5000 }, record = browser();
+  for (const expiresAt of [now - 10000, now + 15001, -1, 1.1, '5000'])
+    assert.throws(() => signChallenge({ ...challenge, expiresAt }, record, identity, now), errorCode('stale_challenge'));
+  assert.throws(() => signChallenge({ ...challenge, issuedAt: now }, record, identity, now), errorCode('invalid_message'));
+  for (const expiresAt of [now, now + 5001, now + 15000]) {
+    const value = { ...challenge, expiresAt }, signature = signChallenge(value, record, identity, now);
+    assert.throws(() => verifyChallenge(value, record, signature, network, now), errorCode('stale_challenge'));
+  }
 });

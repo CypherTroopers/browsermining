@@ -243,7 +243,8 @@ export class MeshDiscoveryClient {
     if (entry?.ready && entry.peers.size < 64) entry.peers.add(record.peerId);
     this.adopt(record.peerId);
     const converted = { type: signal.type, from: record.peerId, ...(signal.type === 'ice' ? { candidate: signal.value } : { sdp: signal.value }) };
-    this.controller.receiveSignal(converted, this.generation).catch(() => { if (this.live()) this.controller.closePeer(record.peerId); });
+    const operation = this.controller.receiveSignal(converted, this.generation), peer = this.controller.peers.get(record.peerId);
+    operation.catch(() => { if (this.live() && peer && this.controller.peers.get(record.peerId) === peer) this.controller.closePeer(record.peerId); });
   }
   enqueue(entry, message, extra = {}) {
     if (!this.live()) return false;

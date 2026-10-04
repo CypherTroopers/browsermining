@@ -1278,6 +1278,51 @@ type txQUICBackgroundForward struct {
 	cancel    context.CancelFunc
 }
 
+// A receiver is one listener generation. Its admission gate makes stopping a
+// generation a barrier for handshakes, certificate builders and packet handlers,
+// without cancelling the node's durable transaction workers.
+type txQUICReceiver struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	listener    *quic.Listener
+	transport   *quic.Transport
+	packetConn  net.PacketConn
+	mu          sync.Mutex
+	stopping    bool
+	connections map[*quic.Conn]struct{}
+	wg          sync.WaitGroup
+}
+
+type txQUICReceiverContextKey struct{}
+
+func (r *txQUICReceiver) begin() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopping {
+		return false
+	}
+	r.wg.Add(1)
+	return true
+}
+
+func (r *txQUICReceiver) addConnection(conn *quic.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopping {
+		return false
+	}
+	r.connections[conn] = struct{}{}
+	r.wg.Add(1)
+	return true
+}
+
+func (r *txQUICReceiver) finishConnection(conn *quic.Conn) {
+	r.mu.Lock()
+	delete(r.connections, conn)
+	r.mu.Unlock()
+	r.wg.Done()
+}
+
 type TxQUICIngress struct {
 	config       TxQUICConfig
 	relayForward txQUICReceiptForwarder // installed before Start; no direct fallback
@@ -1295,6 +1340,11 @@ type TxQUICIngress struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	lifecycleMu      sync.Mutex // serializes full engine Start/Stop
+	receiverMu       sync.Mutex // serializes receiver activation and draining
+	engineStarted    bool
+	stopped          bool
+	receiver         *txQUICReceiver
 	listener         *quic.Listener
 	transport        *quic.Transport
 	packetConn       net.PacketConn
@@ -1364,33 +1414,17 @@ func (config *TxQUICConfig) ApplyFixedCommitteeAutoRole(chainConfig *params.Chai
 	if err != nil || localRnetPort <= 0 {
 		return
 	}
-	localIndex := -1
-	for i := 0; i < len(chainConfig.GenCommittee); i++ {
-		node, ok := chainConfig.GenCommittee[i]
-		if !ok {
-			continue
-		}
-		if config.CommitteePublicKey != "" && strings.EqualFold(strings.TrimPrefix(config.CommitteePublicKey, "0x"), strings.TrimPrefix(node.Public, "0x")) {
-			localIndex = i
-			break
-		}
-	}
-	if localIndex >= 0 {
-		config.Enabled = true
-		config.BridgeEnabled = false
-		config.HTTP3Enabled = false
-		config.Port = localRnetPort + config.PortOffset
-		// Every authenticated FHS committee member is a transaction ingress.
-		// Leader election controls proposal authority, not mempool admission.
-		log.Info("TxQUIC auto role: validator ingress", "committeeIndex", localIndex, "rnetPort", localRnetPort, "txquicPort", config.Port)
-		return
-	}
-
 	config.Enabled = false
 	config.BridgeEnabled = true
+	config.deferReceiverStart = true
+	config.prepareIngress = true
+	config.Port = localRnetPort + config.PortOffset
+	// Prepare role-independent durable state even for a current Common node:
+	// canonical membership can change after genesis or during this process.
 	// CurrentFHSRoute is the only endpoint source. A stale genesis/static list
 	// cannot define a Byzantine quorum and is therefore not retained as fallback.
-	log.Info("TxQUIC auto role: common RPC FHS bridge", "http3rpc", config.HTTP3Enabled)
+	log.Info("TxQUIC auto role: RPC FHS bridge; receiver awaits verified miner identity",
+		"ingressPrepared", config.prepareIngress, "txquicPort", config.Port, "http3rpc", config.HTTP3Enabled)
 }
 
 func (config *TxQUICConfig) ApplyHTTP3RPCDefaults(httpHost string, httpPort int) {
@@ -1754,8 +1788,26 @@ func (q *TxQUICIngress) SetFHSReceiptSigner(publicKey func() ([]byte, error), si
 }
 
 func (q *TxQUICIngress) Start() error {
+	q.lifecycleMu.Lock()
+	defer q.lifecycleMu.Unlock()
+	q.receiverMu.Lock()
+	started, stopped := q.engineStarted, q.stopped
+	q.receiverMu.Unlock()
+	if stopped {
+		return fmt.Errorf("txquic ingress has been stopped")
+	}
+	if started {
+		return nil
+	}
+	if err := q.start(); err != nil {
+		q.stop()
+		return err
+	}
+	return nil
+}
+
+func (q *TxQUICIngress) start() error {
 	if err := q.validateSecurityConfig(); err != nil {
-		q.Stop()
 		return err
 	}
 	if q.wal == nil {
@@ -1769,7 +1821,6 @@ func (q *TxQUICIngress) Start() error {
 	if q.wal != nil {
 		q.bindIngressWALLookups()
 		if err := q.wal.Start(q.ctx); err != nil {
-			q.Stop()
 			return err
 		}
 		if q.outbox != nil {
@@ -1778,19 +1829,16 @@ func (q *TxQUICIngress) Start() error {
 		if q.outbox != nil {
 			identity := txQUICDatabaseIdentity{ChainID: q.config.ChainID, GenesisHash: q.config.GenesisHash}
 			if err := ensureTxQUICDatabaseIdentity(q.outbox.db, txOutboxIdentityKey, identity); err != nil {
-				q.Stop()
 				return err
 			}
 		}
 		if err := q.replayWALOutboxProjection(); err != nil {
-			q.Stop()
 			return err
 		}
 	}
 	if q.config.BridgeEnabled {
 		q.startBackgroundForwardWorkers()
 		if err := q.outbox.Start(q.ctx, q.deliverOutboxPayload, q.restoreOutboxPayload); err != nil {
-			q.Stop()
 			return err
 		}
 	}
@@ -1800,26 +1848,21 @@ func (q *TxQUICIngress) Start() error {
 		q.bridgeAccepting = true
 		q.bridgeAcceptMu.Unlock()
 		if err := q.replayWALLocalIntents(); err != nil {
-			q.Stop()
 			return err
 		}
 	}
-	if q.config.Enabled {
+	if q.config.Enabled || q.config.prepareIngress {
 		if q.txpool == nil {
-			q.Stop()
 			return fmt.Errorf("txquic ingress requires txpool")
 		}
 		if q.ingress != nil {
 			if err := q.ingress.Start(q.ctx); err != nil {
-				q.Stop()
 				return err
 			}
 			if err := q.replayWALInboundProjection(); err != nil {
-				q.Stop()
 				return err
 			}
 			if err := q.restoreDurableIngress(); err != nil {
-				q.Stop()
 				return err
 			}
 			q.wg.Add(1)
@@ -1831,44 +1874,99 @@ func (q *TxQUICIngress) Start() error {
 	// the bounded node-global full-pipeline gate and pool scheduler.
 	if q.liveIngress != nil {
 		if err := q.liveIngress.Start(); err != nil {
-			q.Stop()
 			return err
 		}
 	}
 	if q.poolIngress != nil {
 		if err := q.poolIngress.Start(q.ctx); err != nil {
-			q.Stop()
 			return err
 		}
 	}
 	if err := q.startHTTP3RPC(); err != nil {
-		q.Stop()
 		return err
 	}
-	if !q.config.Enabled {
+	q.receiverMu.Lock()
+	defer q.receiverMu.Unlock()
+	q.engineStarted = true
+	if !q.config.Enabled || q.config.deferReceiverStart {
 		if q.config.BridgeEnabled {
 			log.Info("TxQUIC bridge enabled", "queue", q.config.BridgeQueueSize, "queueBytes", q.config.BridgeQueueMaxBytes, "batch", txQUICMicroBatchMaxTxs, "wireBytes", txQUICMicroBatchMaxWireBytes, "interval", q.config.BridgeBatchInterval)
 		}
 		return nil
 	}
+	// Explicit manual configurations retain their eager listener startup; the
+	// signer may be loaded later and is still checked on every TLS identity.
+	return q.startReceiverLocked(false)
+}
+
+// StartReceiver opens the committee receiver only after its existing signer
+// callbacks prove the current BLS identity and canonical committee endpoint.
+// A bind or identity failure leaves the durable engine and bridge running.
+func (q *TxQUICIngress) StartReceiver() error {
+	if q == nil {
+		return fmt.Errorf("nil txquic ingress")
+	}
+	q.receiverMu.Lock()
+	defer q.receiverMu.Unlock()
+	return q.startReceiverLocked(true)
+}
+
+func (q *TxQUICIngress) startReceiverLocked(verifyIdentity bool) error {
+	if q.stopped || !q.engineStarted || q.ctx.Err() != nil {
+		return fmt.Errorf("txquic durable engine is not running")
+	}
+	if q.receiver != nil {
+		return nil
+	}
+	if !q.config.Enabled && !q.config.prepareIngress {
+		return fmt.Errorf("txquic committee ingress was not prepared at startup")
+	}
+	q.resetServerCertificate()
+	if verifyIdentity {
+		if _, err := q.buildServerCertificate(q.ctx); err != nil {
+			q.resetServerCertificate()
+			return fmt.Errorf("verify txquic receiver identity: %w", err)
+		}
+	}
+	if err := q.ctx.Err(); err != nil {
+		q.resetServerCertificate()
+		return err
+	}
 	addr := txQUICJoinHostPort(q.config.Addr, q.config.Port)
 	packetConn, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		q.Stop()
+		q.resetServerCertificate()
 		return err
 	}
+	ctx, cancel := context.WithCancel(q.ctx)
+	r := &txQUICReceiver{ctx: ctx, cancel: cancel, packetConn: packetConn, connections: make(map[*quic.Conn]struct{})}
 	transport := &quic.Transport{
 		Conn: packetConn,
 		// Require Retry before allocating a bounded handshake slot, preventing
 		// spoofed Initial packets from consuming TLS/BLS verification work.
 		VerifySourceAddress: func(net.Addr) bool { return true },
-		ConnContext:         q.handshakeContext,
+		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+			if !r.begin() {
+				return nil, fmt.Errorf("txquic receiver is stopping")
+			}
+			ctx = context.WithValue(ctx, txQUICReceiverContextKey{}, r)
+			admitted, err := q.handshakeContext(ctx, info)
+			if err != nil {
+				r.wg.Done()
+			}
+			return admitted, err
+		},
 	}
+	r.transport = transport
 	listener, err := transport.Listen(&tls.Config{
 		NextProtos:             []string{txQUICProtocolName},
 		MinVersion:             tls.VersionTLS13,
 		SessionTicketsDisabled: true,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if !r.begin() {
+				return nil, fmt.Errorf("txquic receiver is stopping")
+			}
+			defer r.wg.Done()
 			certificate, err := q.serverCertificate(hello.Context())
 			if err != nil {
 				return nil, err
@@ -1882,25 +1980,88 @@ func (q *TxQUICIngress) Start() error {
 		MaxIdleTimeout:       txQUICForwardIdleTimeout,
 	})
 	if err != nil {
+		r.mu.Lock()
+		r.stopping = true
+		r.mu.Unlock()
+		cancel()
 		_ = transport.Close()
 		_ = packetConn.Close()
-		q.Stop()
+		r.wg.Wait()
+		q.resetServerCertificate()
 		return err
 	}
-	q.listener = listener
-	q.transport = transport
-	q.packetConn = packetConn
+	r.listener = listener
+	q.receiver = r
+	q.listener, q.transport, q.packetConn = listener, transport, packetConn
+	r.begin()
+	go q.acceptLoop(r)
 	log.Info("Started QUIC tx ingress", "addr", addr, "protocol", txQUICProtocolName)
-	q.wg.Add(1)
-	go q.acceptLoop()
 	return nil
+}
+
+// StopReceiver drains the network generation before its miner identity can be
+// changed. It deliberately leaves WAL, outbox and pool schedulers operational.
+func (q *TxQUICIngress) StopReceiver() {
+	if q == nil {
+		return
+	}
+	q.receiverMu.Lock()
+	defer q.receiverMu.Unlock()
+	q.stopReceiverLocked()
+}
+
+func (q *TxQUICIngress) stopReceiverLocked() {
+	r := q.receiver
+	if r != nil {
+		r.mu.Lock()
+		r.stopping = true
+		connections := make([]*quic.Conn, 0, len(r.connections))
+		for conn := range r.connections {
+			connections = append(connections, conn)
+		}
+		r.mu.Unlock()
+		r.cancel()
+		_ = r.listener.Close()
+		// Explicitly notify accepted peers before destroying the transport;
+		// Transport.Close alone tears connections down without a close frame.
+		for _, conn := range connections {
+			_ = conn.CloseWithError(0, "receiver stopping")
+		}
+		// Transport.Close also terminates pending handshakes. An application-
+		// owned socket must be closed separately.
+		_ = r.transport.Close()
+		_ = r.packetConn.Close()
+		r.wg.Wait()
+		q.receiver = nil
+		q.listener, q.transport, q.packetConn = nil, nil, nil
+		log.Info("Stopped QUIC tx receiver")
+	}
+	q.resetServerCertificate()
+}
+
+func (q *TxQUICIngress) ReceiverRunning() bool {
+	if q == nil {
+		return false
+	}
+	q.receiverMu.Lock()
+	defer q.receiverMu.Unlock()
+	return q.receiver != nil
+}
+
+func (q *TxQUICIngress) resetServerCertificate() {
+	q.tlsMu.Lock()
+	q.tlsCertificate = tls.Certificate{}
+	q.tlsGeneration = common.Hash{}
+	q.tlsRouteChecked = time.Time{}
+	q.tlsRouteErr = nil
+	q.tlsMu.Unlock()
 }
 
 func (q *TxQUICIngress) validateSecurityConfig() error {
 	if q == nil {
 		return fmt.Errorf("nil txquic ingress")
 	}
-	if !q.config.Enabled && !q.config.BridgeEnabled && !q.config.HTTP3Enabled {
+	if !q.config.Enabled && !q.config.prepareIngress && !q.config.BridgeEnabled && !q.config.HTTP3Enabled {
 		return nil
 	}
 	if !q.config.FairHotstuff {
@@ -1921,10 +2082,10 @@ func (q *TxQUICIngress) validateSecurityConfig() error {
 	q.routeMu.RLock()
 	hasRouteProvider := q.routeProvider != nil
 	q.routeMu.RUnlock()
-	if (q.config.Enabled || q.config.BridgeEnabled) && !hasRouteProvider {
+	if (q.config.Enabled || q.config.prepareIngress || q.config.BridgeEnabled) && !hasRouteProvider {
 		return fmt.Errorf("Fair HotStuff TxQUIC requires the canonical committee provider")
 	}
-	if q.config.Enabled {
+	if q.config.Enabled || q.config.prepareIngress {
 		if q.ingress == nil {
 			return fmt.Errorf("txquic ingress requires durable storage")
 		}
@@ -1947,12 +2108,28 @@ func (q *TxQUICIngress) validateSecurityConfig() error {
 }
 
 func (q *TxQUICIngress) Stop() {
-	q.backgroundForwardMu.Lock()
-	q.backgroundForwardAccepting = false
-	q.backgroundForwardMu.Unlock()
+	q.lifecycleMu.Lock()
+	defer q.lifecycleMu.Unlock()
+	q.stop()
+}
+
+func (q *TxQUICIngress) stop() {
+	// A receiver activation holds receiverMu while resolving its identity.
+	// Cancel first so full shutdown can interrupt that preflight as well.
 	if q.cancel != nil {
 		q.cancel()
 	}
+	q.receiverMu.Lock()
+	if q.stopped {
+		q.receiverMu.Unlock()
+		return
+	}
+	q.stopped = true
+	q.stopReceiverLocked()
+	q.receiverMu.Unlock()
+	q.backgroundForwardMu.Lock()
+	q.backgroundForwardAccepting = false
+	q.backgroundForwardMu.Unlock()
 	if q.liveIngress != nil {
 		q.liveIngress.Stop()
 	}
@@ -1970,18 +2147,6 @@ func (q *TxQUICIngress) Stop() {
 	}
 	if q.wal != nil {
 		q.wal.Stop()
-	}
-	if q.listener != nil {
-		_ = q.listener.Close()
-	}
-	// A Transport created around an application-owned PacketConn doesn't own or
-	// close that socket. Close both explicitly so pending handshakes and active
-	// connections release their ConnContext admission slots before wg.Wait.
-	if q.transport != nil {
-		_ = q.transport.Close()
-	}
-	if q.packetConn != nil {
-		_ = q.packetConn.Close()
 	}
 	if q.http3Server != nil {
 		_ = q.http3Server.Close()
@@ -3501,22 +3666,22 @@ func (q *TxQUICIngress) startHTTP3RPC() error {
 	return nil
 }
 
-func (q *TxQUICIngress) acceptLoop() {
-	defer q.wg.Done()
+func (q *TxQUICIngress) acceptLoop(r *txQUICReceiver) {
+	defer r.wg.Done()
 	for {
-		conn, err := q.listener.Accept(q.ctx)
+		conn, err := r.listener.Accept(r.ctx)
 		if err != nil {
-			select {
-			case <-q.ctx.Done():
-				return
-			default:
+			if r.ctx.Err() == nil {
 				log.Debug("QUIC tx ingress accept failed", "err", err)
-				continue
 			}
+			return
+		}
+		if !r.addConnection(conn) {
+			_ = conn.CloseWithError(0, "receiver stopping")
+			return
 		}
 		txQUICIngressConnMeter.Mark(1)
-		q.wg.Add(1)
-		go q.handleConn(conn)
+		go q.handleConn(r, conn)
 	}
 }
 
@@ -3547,22 +3712,27 @@ func (q *TxQUICIngress) handshakeContext(ctx context.Context, info *quic.ClientI
 	}
 	select {
 	case q.connSem <- struct{}{}:
-		context.AfterFunc(ctx, func() { <-q.connSem })
+		context.AfterFunc(ctx, func() {
+			<-q.connSem
+			if r, ok := ctx.Value(txQUICReceiverContextKey{}).(*txQUICReceiver); ok {
+				r.wg.Done()
+			}
+		})
 		return ctx, nil
 	default:
 		return nil, fmt.Errorf("too many txquic connections")
 	}
 }
 
-func (q *TxQUICIngress) handleConn(conn *quic.Conn) {
-	defer q.wg.Done()
+func (q *TxQUICIngress) handleConn(r *txQUICReceiver, conn *quic.Conn) {
+	defer r.finishConnection(conn)
 	defer func() { _ = conn.CloseWithError(0, "closed") }()
 	remote := conn.RemoteAddr()
 	for {
-		stream, err := conn.AcceptStream(q.ctx)
+		stream, err := conn.AcceptStream(r.ctx)
 		if err != nil {
 			select {
-			case <-q.ctx.Done():
+			case <-r.ctx.Done():
 				return
 			default:
 				log.Debug("QUIC tx ingress stream accept failed", "remote", remote, "err", err)
@@ -3570,13 +3740,18 @@ func (q *TxQUICIngress) handleConn(conn *quic.Conn) {
 			}
 		}
 		if q.tryAcquireIngressWorker() {
+			if !r.begin() {
+				q.releaseIngressWorker()
+				stream.CancelRead(0)
+				stream.CancelWrite(0)
+				return
+			}
 			txQUICIngressStreamMeter.Mark(1)
-			q.wg.Add(1)
-			go q.handleStream(remote, stream)
+			go q.handleStream(r, remote, stream)
 			continue
 		}
 		select {
-		case <-q.ctx.Done():
+		case <-r.ctx.Done():
 			stream.CancelRead(0)
 			stream.CancelWrite(0)
 			return
@@ -3589,8 +3764,8 @@ func (q *TxQUICIngress) handleConn(conn *quic.Conn) {
 	}
 }
 
-func (q *TxQUICIngress) handleStream(remote net.Addr, stream *quic.Stream) {
-	defer q.wg.Done()
+func (q *TxQUICIngress) handleStream(r *txQUICReceiver, remote net.Addr, stream *quic.Stream) {
+	defer r.wg.Done()
 	defer q.releaseIngressWorker()
 	defer stream.Close()
 	_ = stream.SetReadDeadline(time.Now().Add(q.config.ReadTimeout))
@@ -3646,7 +3821,7 @@ func (q *TxQUICIngress) handleStream(remote net.Addr, stream *quic.Stream) {
 	if liveTimeout <= 0 {
 		liveTimeout = 15 * time.Second
 	}
-	liveCtx, cancelLive := context.WithTimeout(q.ctx, liveTimeout)
+	liveCtx, cancelLive := context.WithTimeout(r.ctx, liveTimeout)
 	releaseLive, err := q.liveIngress.Acquire(liveCtx, txPoolIngressQUIC, len(packet.Items), payloadBytes)
 	cancelLive()
 	if err != nil {
@@ -3686,7 +3861,7 @@ func (q *TxQUICIngress) handleStream(remote net.Addr, stream *quic.Stream) {
 	// the WAL; only after it succeeds may admission indexes or the txpool become
 	// visible to the rest of the node. The combined helper makes real KZG a
 	// non-bypassable precondition of that first durable write.
-	if err := q.appendKZGVerifiedInboundReceived(q.ctx, packet); err != nil {
+	if err := q.appendKZGVerifiedInboundReceived(r.ctx, packet); err != nil {
 		log.Error("TxQUIC blob verification or received-record WAL persistence failed; withholding ACK", "remote", remote, "batch", packet.BatchID, "err", err)
 		return
 	}
@@ -4720,8 +4895,21 @@ func (q *TxQUICIngress) serverCertificate(ctx context.Context) (tls.Certificate,
 		<-refresh
 		return certificate, err
 	}
+	// The builder can outlive its TLS caller. Track it separately so a
+	// receiver stop cannot return while an old identity still fills the cache.
+	var receiver *txQUICReceiver
+	if r, ok := ctx.Value(txQUICReceiverContextKey{}).(*txQUICReceiver); ok {
+		if !r.begin() {
+			<-refresh
+			return tls.Certificate{}, fmt.Errorf("txquic receiver is stopping")
+		}
+		receiver = r
+	}
 	result := make(chan txQUICTLSCertificateResult, 1)
 	go func() {
+		if receiver != nil {
+			defer receiver.wg.Done()
+		}
 		certificate, err := q.buildServerCertificate(ctx)
 		<-refresh
 		result <- txQUICTLSCertificateResult{certificate: certificate, err: err}

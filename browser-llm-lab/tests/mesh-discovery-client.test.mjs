@@ -10,7 +10,7 @@ const A = 'https://gateway-a.example.org', B = 'https://gateway-b.example.org';
 const bytes = s => new TextEncoder().encode(s), hex = b => Buffer.from(b).toString('hex');
 const id = n => n.toString(16).padStart(32, '0');
 const flush = async () => { for (let i = 0; i < 35; i++) await Promise.resolve(); };
-const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 function signedEndpoint(identity = createBrowserIdentity(), origin = B, now = Date.now()) {
   const payload = { version: 1, network, enode: 'enode://' + identity.publicKeyHex, sourceId: 'common-b', gatewayOrigin: origin, bootId: id(700), sequence: 1, issuedAt: now, expiresAt: now + 120000 };
   const raw = bytes(JSON.stringify(payload)), domain = bytes(DISCOVERY_DOMAINS.endpoint), input = new Uint8Array(domain.length + raw.length); input.set(domain); input.set(raw, domain.length);
@@ -76,6 +76,22 @@ test('signed SDP and ICE bind both browser generations and reject replay without
   f.sockets[1].message({ type: 'signal', record: peerRecord, message: forged }); assert.equal(f.received.length, 1);
   const wrong = signSignal({ version: 1, network, from: peer.peerId, to: f.identity.peerId, fromSessionId: id(20), toSessionId: id(999), seq: 2, type: 'ice', value: null, issuedAt: now, expiresAt: now + 30000 }, peer);
   f.sockets[1].message({ type: 'signal', record: peerRecord, message: wrong }); assert.equal(f.received.length, 1);
+});
+
+for (const scenario of ['replacement', 'new-generation', 'current']) test(`signed negotiation failure protects ${scenario} peer ownership`, async t => {
+  const f = fixtures(t), peer = createBrowserIdentity(), peerRecord = record(peer), operation = deferred();
+  f.manager.start(); await flush(); f.ready(f.sockets[0]); f.ready(f.sockets[1], [peerRecord]);
+  const old = { sessionId: id(20) };
+  f.c.receiveSignal = () => { f.c.peers.set(peer.peerId, old); return operation.promise; };
+  const now = Date.now(), message = signSignal({ version: 1, network, from: peer.peerId, to: f.identity.peerId, fromSessionId: id(20),
+    toSessionId: id(1), seq: 1, type: 'offer', value: 'v=0', issuedAt: now, expiresAt: now + 30000 }, peer);
+  f.sockets[1].message({ type: 'signal', record: peerRecord, message }); assert.equal(f.c.peers.get(peer.peerId), old);
+  const replacement = { sessionId: id(20) };
+  if (scenario !== 'current') f.c.peers.set(peer.peerId, replacement);
+  if (scenario === 'new-generation') { f.c.stop(); f.c.requested = true; f.c.generation++; }
+  operation.reject(new Error('old remote description rejected')); await flush();
+  if (scenario === 'current') assert.equal(f.c.peers.has(peer.peerId), false, 'current failed negotiation still closes its own peer');
+  else assert.equal(f.c.peers.get(peer.peerId), replacement, 'stale rejection must preserve the replacement');
 });
 
 test('signals from an adjacent valid gateway renewal use current identity without rolling the cache backwards', async t => {

@@ -144,6 +144,9 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 		return nil, cfg
 	}
 	cfg.browserPublicRelay = publicRelay
+	// Browser services require the Common role throughout the process lifetime,
+	// including later miner.start calls that establish a verified BLS identity.
+	cfg.Eth.CommonOnly = cfg.browserGateway != nil || cfg.browserLightnode != nil || cfg.browserPublicRelay != nil
 	stack, err := node.New(&cfg.Node)
 	if err != nil {
 		_ = browserstartup.CloseOnError(err, cfg.browserPublicRelay.Close, cfg.browserLightnode.Close, cfg.browserGateway.Close)
